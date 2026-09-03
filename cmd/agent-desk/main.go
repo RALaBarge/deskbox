@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"log"
@@ -30,13 +31,27 @@ func NewDesk(tools map[string]*Tool, q *Queue, dataDir string) *Desk {
 }
 
 func main() {
+	if err := loadDotenv(".env"); err != nil {
+		log.Fatalf("load .env: %v", err)
+	}
+	settings := LoadSettings()
+
 	addr := flag.String("addr", ":8080", "listen address (host:port)")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
-	postgresDSN := flag.String("postgres-dsn", os.Getenv("DESKBOX_POSTGRES_DSN"),
+	postgresDSN := flag.String("postgres-dsn", settings.PostgresDSN,
 		"Postgres DSN for durable jobs + idempotency_key dedup (optional; unset = in-memory only)")
 	flag.Parse()
+
+	if settings.AuthEnabled && settings.AuthToken == "" {
+		log.Fatalf("DESKBOX_AUTH_ENABLED is set but DESKBOX_AUTH_TOKEN is empty")
+	}
+	if settings.AuthEnabled {
+		log.Printf("auth: enabled — requests need Authorization: Bearer <token>")
+	} else {
+		log.Printf("auth: disabled — anything that can reach %s can submit jobs", *addr)
+	}
 
 	tools, err := LoadTools(*toolsDir)
 	if err != nil {
@@ -84,9 +99,29 @@ func main() {
 	mux.HandleFunc("GET /jobs/{id}/out/{file...}", d.handleGetOutFile)
 	mux.HandleFunc("GET /queue", d.handleQueueStats)
 
-	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	var handler http.Handler = mux
+	if settings.AuthEnabled {
+		handler = requireAuth(settings.AuthToken, mux)
+	}
+
+	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("agent-desk listening on %s", *addr)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// requireAuth rejects any request without a matching Authorization: Bearer
+// <token> header. Comparison is constant-time so response timing can't leak
+// how much of the token a guess got right.
+func requireAuth(token string, next http.Handler) http.Handler {
+	want := []byte(token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (d *Desk) handleStatus(w http.ResponseWriter, r *http.Request) {

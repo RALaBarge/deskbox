@@ -160,6 +160,30 @@ go build -o bin/agent-desk ./cmd/agent-desk
 No demo tools ship in this repo. Write a `tcs.yaml` + `run.sh` under
 `tools/<name>/` following the conventions above and the desk will pick it up.
 
+## Settings (.env, optional)
+
+The desk reads a `.env` file (`KEY=VALUE` per line, `#` comments allowed) in
+the working directory on startup and merges it into the process
+environment, without overwriting any variable already set for real (a real
+env var, e.g. from systemd, always wins over the file). Missing file is
+fine, nothing changes. This is where auth and any future runtime toggle
+live, instead of a separate flag for each one.
+
+```bash
+# .env
+DESKBOX_AUTH_ENABLED=true
+DESKBOX_AUTH_TOKEN=some-long-random-string
+```
+
+| Variable | Purpose |
+|---|---|
+| `DESKBOX_AUTH_ENABLED` | `true` to require a bearer token on every request. Default off. |
+| `DESKBOX_AUTH_TOKEN` | The token clients must send as `Authorization: Bearer <token>`. Required if auth is enabled. |
+| `DESKBOX_POSTGRES_DSN` | Same as `-postgres-dsn` below; the flag wins if both are set. |
+
+`.env` is gitignored. Never commit a real token, generate one per
+deployment (`openssl rand -hex 32` works fine).
+
 ## Idempotency (Postgres, optional)
 
 By default job state lives only in memory. A desk restart drops history, and
@@ -200,7 +224,7 @@ as before: in-memory only, `idempotency_key` accepted but ignored.
 - [x] Durable job log + idempotency (Postgres, optional): `idempotency_key`
       dedup, resume of `queued`/`running` jobs after a crash/restart
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
-- [ ] Auth token for the desk
+- [x] Auth token for the desk (optional, `.env`-driven, see Settings above)
 - [ ] pi plugin: operator agent that talks to the desk (the original idea)
 
 ## License
