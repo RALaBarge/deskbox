@@ -207,4 +207,5 @@ as before: in-memory only, `idempotency_key` accepted but ignored.
 
 ## License
 
-Not yet chosen.
+[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for any noncommercial
+purpose. Commercial use needs a separate license from the author.
