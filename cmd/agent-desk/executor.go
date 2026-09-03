@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -159,6 +161,13 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 	cmd := exec.CommandContext(ctx, tool.runPath)
 	cmd.Dir = jobDir
 	cmd.Stdin = bytes.NewReader(inData)
+	// If the desk process itself dies hard (OOM-killed, kill -9, a crash —
+	// not the clean-shutdown case), nothing else tells this child its parent
+	// is gone: it would otherwise be reparented to init and keep running
+	// detached, writing into the same job dir Resume() is about to reuse for
+	// a second, duplicate run of the same job. Pdeathsig closes that no
+	// matter how violently the desk dies, without needing graceful shutdown.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -174,11 +183,14 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 	}
 
 	toolDir := filepath.Dir(tool.runPath)
+	scoped := false
 	if args, err := bakeSandbox(tool, inDir, outDir, toolDir); err == nil {
 		script := filepath.Join("/deskbox/tool", filepath.Base(tool.runPath))
 		args = append(args, script)
-		cmd.Path = args[0]
-		cmd.Args = args
+		wrapped := wrapWithResourceLimits(args, d.settings, d.resourceLimitsOK.Load())
+		scoped = len(wrapped) > len(args)
+		cmd.Path = wrapped[0]
+		cmd.Args = wrapped
 	} else {
 		log.Printf("WARN: sandbox unavailable (%v); running unsandboxed (advisory only)", err)
 	}
@@ -194,6 +206,19 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 		msg := strings.TrimSpace(errBuf.String())
 		if msg == "" {
 			msg = runErr.Error()
+		}
+		// systemd-run --user --scope needs a live user D-Bus session. The
+		// boot-time probe (canScopeJobs) can pass and then stop being true
+		// later — an SSH-launched process losing its session, a container
+		// without full session infrastructure, distro-specific quirks — so
+		// this is a real failure mode seen in practice, not hypothetical.
+		// Fail open: disable the wrapper for the rest of this process's
+		// life instead of breaking every subsequent job forever. This job
+		// still fails and goes through the tool's normal retry policy,
+		// exactly like any other transient infrastructure hiccup.
+		if scoped && strings.Contains(msg, "Failed to connect to bus") && d.resourceLimitsOK.CompareAndSwap(true, false) {
+			log.Printf("WARN: systemd-run --user --scope stopped working mid-run (%s); "+
+				"disabling job memory/task-count limits for the rest of this process's life", truncate(msg, 200))
 		}
 		return nil, fmt.Errorf("tool exited with error: %s", truncate(msg, 500))
 	}
@@ -212,7 +237,20 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 			if pathTraverses(f) {
 				continue
 			}
-			b, err := os.ReadFile(filepath.Join(outDir, filepath.Clean(f)))
+			p := filepath.Join(outDir, filepath.Clean(f))
+			// out/ is bind-mounted read-write into the sandbox, so the tool
+			// could write a symlink instead of a real file (e.g. pointing at
+			// /etc/passwd or the host's .env) and have the desk read the
+			// target on its behalf once the sandbox is gone. Refuse anything
+			// that isn't a plain regular file.
+			fi, statErr := os.Lstat(p)
+			if statErr != nil {
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				return nil, fmt.Errorf("%w: declared output %q is not a regular file", ErrContract, f)
+			}
+			b, err := os.ReadFile(p)
 			if err == nil {
 				raw = b
 				break
@@ -244,6 +282,11 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 
 // auditOutDir walks out/ and returns every file that is not declared in the
 // contract's sandbox.out. Empty declared list means: no writes at all.
+//
+// A symlink is always a violation, regardless of its name: out/ is bound
+// read-write into the sandbox, so a symlink is how a tool would try to make
+// the desk read (or later serve) an arbitrary host path once the sandbox
+// that wrote it is gone.
 func auditOutDir(outDir string, declared []string) []string {
 	allowed := map[string]bool{}
 	for _, d := range declared {
@@ -251,10 +294,17 @@ func auditOutDir(outDir string, declared []string) []string {
 	}
 	var viol []string
 	_ = filepath.WalkDir(outDir, func(p string, de os.DirEntry, err error) error {
-		if err != nil || p == outDir || de.IsDir() {
+		if err != nil || p == outDir {
 			return nil
 		}
 		rel, _ := filepath.Rel(outDir, p)
+		if de.Type()&os.ModeSymlink != 0 {
+			viol = append(viol, rel+" (symlink, not allowed)")
+			return nil
+		}
+		if de.IsDir() {
+			return nil
+		}
 		if !allowed[rel] {
 			viol = append(viol, rel)
 		}
@@ -273,6 +323,55 @@ func pathTraverses(p string) bool {
 func hasBwrap() bool {
 	_, err := exec.LookPath("bwrap")
 	return err == nil
+}
+
+// canScopeJobs checks, once at startup, whether `systemd-run --user --scope`
+// actually works here — not just whether the binary exists. It needs a
+// working user D-Bus session (XDG_RUNTIME_DIR + a running systemd --user
+// instance), which a plain non-interactive process — the desk started over
+// bare SSH, or as a systemd service without a linger'd/logind session — may
+// not have even though the binary is on PATH. A real probe, done once,
+// avoids silently failing cmd.Run() for every single job the first time one
+// actually executes.
+func canScopeJobs() bool {
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		return false
+	}
+	cmd := exec.Command("systemd-run", "--user", "--scope", "--quiet",
+		"-p", "MemoryMax=16M", "--", "/bin/true")
+	return cmd.Run() == nil
+}
+
+// wrapWithResourceLimits prefixes argv with systemd-run so the job's process
+// tree runs in its own cgroup scope, capped independently of every other
+// concurrent job. bwrap's namespaces isolate identity and filesystem
+// visibility; they do not cap memory or process count, so without this a
+// single runaway or malicious tool (leak, fork bomb, infinite loop) can
+// degrade the host for every other job running at the same time — a real
+// risk once real, less-trusted tool traffic is running 10-wide.
+//
+// systemd-run --scope attaches the cgroup and then execs directly into the
+// target (no supervisor process stays in between), so this changes nothing
+// about how the caller's context-timeout kill or bwrap's --die-with-parent
+// behave: the PID Go spawned is still the PID that ends up running.
+func wrapWithResourceLimits(args []string, s *Settings, available bool) []string {
+	if !available {
+		return args
+	}
+	// cmd.Path is set directly from args[0] below (same reasoning as
+	// bakeSandbox's bw): Go only resolves PATH for exec.Command, not for a
+	// manually-assigned cmd.Path/cmd.Args, so this needs the absolute path.
+	sr, err := exec.LookPath("systemd-run")
+	if err != nil {
+		return args
+	}
+	prefix := []string{
+		sr, "--user", "--scope", "--quiet",
+		"-p", "MemoryMax=" + s.JobMemoryMax,
+		"-p", "MemorySwapMax=0",
+		"-p", "TasksMax=" + strconv.Itoa(s.JobTasksMax),
+	}
+	return append(prefix, args...)
 }
 
 func truncate(s string, n int) string {

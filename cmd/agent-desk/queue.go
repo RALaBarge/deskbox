@@ -114,12 +114,21 @@ func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey st
 			return nil, fmt.Errorf("persist job: %w", err)
 		}
 		if !created {
-			// Same (tool, idempotency_key) already has a job — whatever its
-			// current status, that's the one true result. Do not run again.
+			// Same (tool, idempotency_key) already has a job. If it's still
+			// tracked in-process (queued/running), that pointer — not the
+			// point-in-time DB snapshot — is the live truth: overwriting the
+			// map entry with the snapshot here would orphan it, and every
+			// later GET would show the job frozen at whatever status it had
+			// at this exact moment, even after it actually finishes.
 			q.mu.Lock()
-			q.jobs[existing.ID] = existing
+			live, tracked := q.jobs[existing.ID]
+			if !tracked {
+				q.jobs[existing.ID] = existing
+				live = existing
+			}
+			cp := *live
 			q.mu.Unlock()
-			return existing, nil
+			return &cp, nil
 		}
 		job = existing // canonical row as Postgres stored it
 	}
@@ -129,10 +138,22 @@ func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey st
 	q.mu.Unlock()
 	select {
 	case q.ch <- job:
-		return job, nil
+		return q.snapshot(job), nil
 	case <-q.stop:
 		return nil, errors.New("queue stopped")
 	}
+}
+
+// snapshot copies a Job's current field values under the queue's lock. A
+// worker mutates a Job's fields in place via its own pointer in q.jobs; any
+// caller serializing that job for an HTTP response must not read it without
+// the same lock, or it races the worker. Copying returns a safe, private
+// view instead.
+func (q *Queue) snapshot(job *Job) *Job {
+	q.mu.Lock()
+	cp := *job
+	q.mu.Unlock()
+	return &cp
 }
 
 // Get looks up a job. The error return is non-nil only for an actual store
@@ -143,8 +164,11 @@ func (q *Queue) Get(id string) (*Job, bool, error) {
 	q.mu.Lock()
 	j, ok := q.jobs[id]
 	q.mu.Unlock()
-	if ok || q.store == nil {
-		return j, ok, nil
+	if ok {
+		return q.snapshot(j), true, nil
+	}
+	if q.store == nil {
+		return nil, false, nil
 	}
 	stored, found, err := q.store.Get(id)
 	if err != nil {
@@ -157,7 +181,7 @@ func (q *Queue) Get(id string) (*Job, bool, error) {
 	q.mu.Lock()
 	q.jobs[stored.ID] = stored
 	q.mu.Unlock()
-	return stored, true, nil
+	return q.snapshot(stored), true, nil
 }
 
 func (q *Queue) worker() {
@@ -203,7 +227,12 @@ func (q *Queue) process(job *Job) {
 		job.Error = err.Error()
 		q.mu.Unlock()
 		q.persist(job)
-		time.Sleep(backoff)
+		select {
+		case <-time.After(backoff):
+		case <-q.stop:
+			q.finish(job, nil, err)
+			return
+		}
 		select {
 		case q.ch <- job:
 		case <-q.stop:

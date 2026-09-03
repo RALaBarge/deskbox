@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -31,7 +32,7 @@ type OutputSpec struct {
 }
 
 type SideEffects struct {
-	Files   []string `yaml:"files" json:"files"`   // empty = no file writes allowed
+	Files   []string `yaml:"files" json:"files"`     // empty = no file writes allowed
 	Network bool     `yaml:"network" json:"network"` // true = egress allowed
 }
 
@@ -61,6 +62,12 @@ func (e ExecutionSpec) Timeout() time.Duration {
 
 // LoadTools scans dir for tool folders. A folder is a tool iff it contains a
 // tcs.yaml and an executable run script.
+//
+// A folder that has a tcs.yaml but fails to load (bad YAML, no executable
+// run script yet, a duplicate tool name) is logged and skipped rather than
+// failing the whole load: one WIP tool folder — a contract added before
+// run.sh is chmod +x, a YAML typo — must not make every other tool
+// unreachable, especially across a restart meant to pick up new tools.
 func LoadTools(dir string) (map[string]*Tool, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -83,7 +90,8 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 		}
 		var t Tool
 		if err := yaml.Unmarshal(raw, &t); err != nil {
-			return nil, fmt.Errorf("%s: bad tcs.yaml: %w", name, err)
+			log.Printf("WARN: skipping tool folder %q: bad tcs.yaml: %v", name, err)
+			continue
 		}
 		t.dir = tdir
 		t.raw = raw
@@ -92,9 +100,14 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 		}
 		run, err := resolveRunScript(tdir)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", name, err)
+			log.Printf("WARN: skipping tool folder %q: %v", name, err)
+			continue
 		}
 		t.runPath = run
+		if _, dup := tools[t.Name]; dup {
+			log.Printf("WARN: skipping tool folder %q: name %q already loaded from another folder", name, t.Name)
+			continue
+		}
 		tools[t.Name] = &t
 	}
 	return tools, nil

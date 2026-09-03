@@ -180,9 +180,34 @@ DESKBOX_AUTH_TOKEN=some-long-random-string
 | `DESKBOX_AUTH_ENABLED` | `true` to require a bearer token on every request. Default off. |
 | `DESKBOX_AUTH_TOKEN` | The token clients must send as `Authorization: Bearer <token>`. Required if auth is enabled. |
 | `DESKBOX_POSTGRES_DSN` | Same as `-postgres-dsn` below; the flag wins if both are set. |
+| `DESKBOX_JOB_MEMORY_MAX` | Per-job memory cap (systemd `MemoryMax` syntax, e.g. `512M`). Default `512M`. |
+| `DESKBOX_JOB_TASKS_MAX` | Per-job cap on forked processes/threads (systemd `TasksMax`), stops fork bombs. Default `64`. |
 
 `.env` is gitignored. Never commit a real token, generate one per
 deployment (`openssl rand -hex 32` works fine).
+
+### Per-job resource limits
+
+`bwrap`'s namespaces isolate what a tool can *see*; they don't cap what it
+can *consume*. Without a cap, one runaway or malicious tool (a leak, a fork
+bomb, an infinite loop) can degrade the host for every other job running at
+the same time — a real risk once real tool traffic runs 10-wide. The desk
+closes this by running each job in its own `systemd --user` scope
+(`systemd-run --user --scope`) with `MemoryMax`/`TasksMax` set.
+
+This needs a working user D-Bus session, which a plain interactive shell has
+but a bare background/service process may not, depending on the distro and
+how it's launched. If jobs fail with `Failed to connect to bus`, run:
+
+```bash
+loginctl enable-linger $(whoami)
+```
+
+so the session persists independent of any active login, then restart the
+desk. If `systemd-run` isn't usable at all, the desk detects that (once at
+startup, and again if it stops working mid-run) and disables the wrapper
+instead of failing every job — logged clearly either way, same as the
+`bwrap`-missing and Postgres-unset cases.
 
 ## Idempotency (Postgres, optional)
 
@@ -225,7 +250,9 @@ as before: in-memory only, `idempotency_key` accepted but ignored.
       dedup, resume of `queued`/`running` jobs after a crash/restart
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [x] Auth token for the desk (optional, `.env`-driven, see Settings above)
-- [ ] pi plugin: operator agent that talks to the desk (the original idea)
+- [x] Per-job memory/task-count cgroup limits (`systemd-run --user --scope`,
+      fails open with a clear warning if the environment can't support it)
+- [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 
 ## License
 

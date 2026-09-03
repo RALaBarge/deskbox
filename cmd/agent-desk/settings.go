@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,13 @@ type Settings struct {
 	AuthEnabled bool
 	AuthToken   string
 	PostgresDSN string
+
+	// Per-job cgroup limits (via systemd-run --scope). bwrap's namespaces
+	// isolate what a tool can see; they don't cap what it can consume, so
+	// without these one runaway or malicious tool degrades the host for
+	// every other job running at the same time.
+	JobMemoryMax string // systemd MemoryMax, e.g. "512M"
+	JobTasksMax  int    // systemd TasksMax: caps forked processes/threads, stops fork bombs
 }
 
 // loadDotenv reads KEY=VALUE lines from path into the process environment.
@@ -50,11 +58,35 @@ func loadDotenv(path string) error {
 	return scanner.Err()
 }
 
-func LoadSettings() *Settings {
-	authEnabled, _ := strconv.ParseBool(os.Getenv("DESKBOX_AUTH_ENABLED"))
-	return &Settings{
-		AuthEnabled: authEnabled,
-		AuthToken:   os.Getenv("DESKBOX_AUTH_TOKEN"),
-		PostgresDSN: os.Getenv("DESKBOX_POSTGRES_DSN"),
+func LoadSettings() (*Settings, error) {
+	authEnabled := false
+	if v := os.Getenv("DESKBOX_AUTH_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("DESKBOX_AUTH_ENABLED=%q is not a valid boolean", v)
+		}
+		authEnabled = b
 	}
+
+	memMax := os.Getenv("DESKBOX_JOB_MEMORY_MAX")
+	if memMax == "" {
+		memMax = "512M"
+	}
+
+	tasksMax := 64
+	if v := os.Getenv("DESKBOX_JOB_TASKS_MAX"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("DESKBOX_JOB_TASKS_MAX=%q is not a positive integer", v)
+		}
+		tasksMax = n
+	}
+
+	return &Settings{
+		AuthEnabled:  authEnabled,
+		AuthToken:    os.Getenv("DESKBOX_AUTH_TOKEN"),
+		PostgresDSN:  os.Getenv("DESKBOX_POSTGRES_DSN"),
+		JobMemoryMax: memMax,
+		JobTasksMax:  tasksMax,
+	}, nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,13 +20,20 @@ const version = "0.1.0"
 // through here, so the contract (TCS) is load-bearing: inputs are validated on
 // the way in, side effects and output schema on the way out.
 type Desk struct {
-	tools   map[string]*Tool
-	queue   *Queue
-	dataDir string
+	tools    map[string]*Tool
+	queue    *Queue
+	dataDir  string
+	settings *Settings
+	// resourceLimitsOK: systemd-run --user --scope confirmed working at
+	// startup. Can flip false at runtime if a job discovers it stopped
+	// working (see the "Failed to connect to bus" handling in Execute) —
+	// atomic because concurrent workers read and (rarely) write it.
+	resourceLimitsOK atomic.Bool
 }
 
-func NewDesk(tools map[string]*Tool, q *Queue, dataDir string) *Desk {
-	d := &Desk{tools: tools, queue: q, dataDir: dataDir}
+func NewDesk(tools map[string]*Tool, q *Queue, dataDir string, settings *Settings, resourceLimitsOK bool) *Desk {
+	d := &Desk{tools: tools, queue: q, dataDir: dataDir, settings: settings}
+	d.resourceLimitsOK.Store(resourceLimitsOK)
 	q.desk = d
 	return d
 }
@@ -34,7 +42,10 @@ func main() {
 	if err := loadDotenv(".env"); err != nil {
 		log.Fatalf("load .env: %v", err)
 	}
-	settings := LoadSettings()
+	settings, err := LoadSettings()
+	if err != nil {
+		log.Fatalf("settings: %v", err)
+	}
 
 	addr := flag.String("addr", ":8080", "listen address (host:port)")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
@@ -65,6 +76,15 @@ func main() {
 		log.Printf("sandbox: WARNING bubblewrap NOT found — network:false enforced as advisory only")
 	}
 
+	resourceLimitsOK := canScopeJobs()
+	if resourceLimitsOK {
+		log.Printf("resource limits: systemd-run --user --scope available — jobs capped at %s memory, %d tasks",
+			settings.JobMemoryMax, settings.JobTasksMax)
+	} else {
+		log.Printf("WARN: systemd-run --user --scope not usable here (no user D-Bus session? see README) — " +
+			"job memory/task-count limits are NOT enforced")
+	}
+
 	var store *Store
 	if *postgresDSN != "" {
 		s, err := NewStore(*postgresDSN)
@@ -82,7 +102,7 @@ func main() {
 	q.Start()
 	defer q.Stop()
 
-	d := NewDesk(tools, q, *dataDir)
+	d := NewDesk(tools, q, *dataDir, settings, resourceLimitsOK)
 
 	if n, err := q.Resume(); err != nil {
 		log.Printf("resume from postgres: %v", err)
@@ -246,9 +266,15 @@ func (d *Desk) handleGetJob(w http.ResponseWriter, r *http.Request) {
 
 // handleGetOutFile streams a file from the job's out/ dir — the "simply tail"
 // surface. Works while the job is still running, and stays available after.
+//
+// Only names the tool's own contract declares in sandbox.out are servable,
+// and only if the path is a regular file: the desk bind-mounts out/
+// read-write into the sandbox, so a tool could otherwise write a symlink
+// (e.g. to /etc/passwd or the host's .env) and have the desk read the
+// symlink's target on its behalf once the sandbox is gone.
 func (d *Desk) handleGetOutFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_, ok, err := d.queue.Get(id)
+	job, ok, err := d.queue.Get(id)
 	if err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
 		return
@@ -262,17 +288,36 @@ func (d *Desk) handleGetOutFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid path"})
 		return
 	}
+	tool, ok := d.tools[job.Tool]
+	if !ok || !declaresOut(tool, rel) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not a declared output file for this tool"})
+		return
+	}
 	base := filepath.Join(d.dataDir, "jobs", id, "out")
 	p := filepath.Join(base, filepath.Clean(rel))
 	if !strings.HasPrefix(p, base+string(filepath.Separator)) && p != base {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid path"})
 		return
 	}
-	if _, err := os.Stat(p); err != nil {
+	fi, statErr := os.Lstat(p)
+	if statErr != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "output file not yet written"})
 		return
 	}
+	if !fi.Mode().IsRegular() {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "refusing to serve a non-regular file"})
+		return
+	}
 	http.ServeFile(w, r, p)
+}
+
+func declaresOut(tool *Tool, rel string) bool {
+	for _, o := range tool.Sandbox.Out {
+		if filepath.Clean(o) == filepath.Clean(rel) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Desk) handleQueueStats(w http.ResponseWriter, r *http.Request) {
