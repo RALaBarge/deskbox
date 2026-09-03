@@ -197,7 +197,11 @@ func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Desk) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := d.queue.Get(r.PathValue("id"))
+	job, ok, err := d.queue.Get(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
 		return
@@ -209,7 +213,12 @@ func (d *Desk) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // surface. Works while the job is still running, and stays available after.
 func (d *Desk) handleGetOutFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := d.queue.Get(id); !ok {
+	_, ok, err := d.queue.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
 		return
 	}

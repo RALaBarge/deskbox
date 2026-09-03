@@ -135,21 +135,29 @@ func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey st
 	}
 }
 
-func (q *Queue) Get(id string) (*Job, bool) {
+// Get looks up a job. The error return is non-nil only for an actual store
+// failure (e.g. Postgres unreachable) — callers must not fold that into "not
+// found": an agent polling a real job during a DB blip needs to see that the
+// lookup failed, not that its job vanished.
+func (q *Queue) Get(id string) (*Job, bool, error) {
 	q.mu.Lock()
 	j, ok := q.jobs[id]
 	q.mu.Unlock()
 	if ok || q.store == nil {
-		return j, ok
+		return j, ok, nil
 	}
 	stored, found, err := q.store.Get(id)
-	if err != nil || !found {
-		return nil, false
+	if err != nil {
+		log.Printf("job %s: lookup in postgres failed: %v", id, err)
+		return nil, false, err
+	}
+	if !found {
+		return nil, false, nil
 	}
 	q.mu.Lock()
 	q.jobs[stored.ID] = stored
 	q.mu.Unlock()
-	return stored, true
+	return stored, true, nil
 }
 
 func (q *Queue) worker() {
