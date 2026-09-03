@@ -53,8 +53,15 @@ output:                    # validated on the way out — violations => job fail
       result: { type: string }
 
 allowed_side_effects:      # structural, not advisory
-  files: []                # empty = no file writes allowed (scratch-dir audit)
+  files: []                # empty = no file writes allowed (out/ audit)
   network: false           # false = egress cut by bubblewrap --unshare-net
+
+sandbox:                   # the per-job workspace surface (bwrap layer)
+  in: [input.json]         # exact files the pull needs — materialized by the
+                           #   desk, bound read-only one by one (the tool can't
+                           #   even list siblings)
+  out: [result.json]       # files the tool may write — host-tailable live
+                           #   (tail -f the real path, or GET /jobs/<id>/out/<f>)
 
 execution:
   mode: queued             # queued (async, retried) | direct (sync)
@@ -82,7 +89,12 @@ minItems/maxItems, enum, minLength/maxLength, minimum/maximum`.
 | `GET /tools/{name}` | Raw `tcs.yaml` — the contract to conform to |
 | `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}}` |
 | `GET /jobs/{id}` | Poll job status / result / error |
+| `GET /jobs/{id}/out/{file}` | Tail a job's output file (live while running) |
 | `GET /queue` | Queue depth, worker count, recent jobs |
+
+Each job gets a stable workspace at `<data>/jobs/<id>/` with `in/` and `out/`.
+`out/result.json` (or whatever `sandbox.out` declares) is a real file — tail it
+live from the shell while the job runs, or via `GET /jobs/{id}/out/result.json`.
 
 A conforming request to `POST /tools/example-tool`:
 
@@ -109,12 +121,32 @@ curl -X POST localhost:8080/tools/example-tool -d '{"input": {}}'
 | Rule | Enforced by | Never-retried? |
 |---|---|---|
 | Input matches `input` schema | validator at submit | — (rejected, HTTP 400) |
-| No forbidden file writes | scratch-dir audit post-run | ✅ permanent |
+| No forbidden file writes | `out/` audit post-run | ✅ permanent |
 | No network egress when `network:false` | bubblewrap `--unshare-net` | structural |
-| Output is one JSON doc | stdout parse | ✅ permanent |
+| Output is one JSON doc | stdout parse or `out/` file | ✅ permanent |
 | Output matches `output` schema | validator | ✅ permanent |
 | Transient tool failure | queue retry w/ exponential backoff | retried up to `max_retries` |
 | Tool hangs | per-job timeout | retried (timeout) |
+
+## The bwrap layer (minimal by construction)
+
+Every job runs inside its own bubblewrap sandbox. Inside, the tool sees **only**:
+
+- `/deskbox/in/` — exactly the files declared in `sandbox.in`, each bound
+  read-only individually (the tool cannot list siblings it wasn't given)
+- `/deskbox/out/` — the writable output dir (host-tailable, real path)
+- `/deskbox/tool/` — the tool's own folder, read-only
+- `/usr /bin /sbin /lib /lib64`, a bare minimum of `/etc`, `/dev`, `/proc`, tmpfs `/tmp`
+
+**The host filesystem is NOT mounted** — no `--ro-bind / /`. Home dirs,
+`~/.ssh`, `/var`, service secrets: invisible. Environment is fully controlled
+(`cmd.Env`): `OPENROUTER_API_KEY` and the rest of the host shell env never
+reach the sandbox. `network: false` adds `--unshare-net`; with egress allowed,
+DNS + TLS roots are bound so curl/git work.
+
+(The toplevel `/bin /sbin /lib /lib64` are Fedora symlinks to `usr/`; they
+must be bound alongside `/usr` or the ELF interpreter can't resolve and
+`execvp` fails with ENOENT.)
 
 ## Build & run
 
@@ -124,14 +156,16 @@ go build -o bin/agent-desk ./cmd/agent-desk
 ./bin/agent-desk -addr :8080 -workers 2        # -tools defaults to ./tools
 ```
 
-Demo tools included: `example-tool` (echo, exercises input gate + retry +
-file-write violation) and `net-probe` (proves egress is cut).
+Demo tools included: `example-tool` (file protocol — input gate, retry,
+undeclared-write violation, live tail, host-privacy peek) and `net-probe`
+(stdio protocol — proves egress is cut).
 
 ## Status / roadmap
 
-- [x] TCS loading, input gate, output schema, scratch-dir file audit
+- [x] TCS loading, input gate, output schema, out/ file-write audit
 - [x] Queued execution, worker pool, retries with backoff, job history
-- [x] bubblewrap network isolation
+- [x] Minimal per-job bwrap layer: only declared in/ + out/ visible, no host
+      mounts, controlled env, live-tailable output files + HTTP tail endpoint
 - [ ] `tcs-verify` Rust CLI (offline spec linting) — stub only
 - [ ] Persistent job log (SQLite) + auth token for the desk
 - [ ] pi plugin: operator agent that talks to the desk (the original idea)

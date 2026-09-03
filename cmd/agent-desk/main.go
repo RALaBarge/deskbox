@@ -5,7 +5,10 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -15,12 +18,13 @@ const version = "0.1.0"
 // through here, so the contract (TCS) is load-bearing: inputs are validated on
 // the way in, side effects and output schema on the way out.
 type Desk struct {
-	tools map[string]*Tool
-	queue *Queue
+	tools   map[string]*Tool
+	queue   *Queue
+	dataDir string
 }
 
-func NewDesk(tools map[string]*Tool, q *Queue) *Desk {
-	d := &Desk{tools: tools, queue: q}
+func NewDesk(tools map[string]*Tool, q *Queue, dataDir string) *Desk {
+	d := &Desk{tools: tools, queue: q, dataDir: dataDir}
 	q.desk = d
 	return d
 }
@@ -29,6 +33,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address (host:port)")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 2, "number of queued-execution workers")
+	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
 	flag.Parse()
 
 	tools, err := LoadTools(*toolsDir)
@@ -47,7 +52,7 @@ func main() {
 	q.Start()
 	defer q.Stop()
 
-	d := NewDesk(tools, q)
+	d := NewDesk(tools, q, *dataDir)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", d.handleStatus)
@@ -55,6 +60,7 @@ func main() {
 	mux.HandleFunc("GET /tools/{name}", d.handleGetTool)
 	mux.HandleFunc("POST /tools/{name}", d.handleSubmit)
 	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
+	mux.HandleFunc("GET /jobs/{id}/out/{file...}", d.handleGetOutFile)
 	mux.HandleFunc("GET /queue", d.handleQueueStats)
 
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -174,8 +180,42 @@ func (d *Desk) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// handleGetOutFile streams a file from the job's out/ dir — the "simply tail"
+// surface. Works while the job is still running, and stays available after.
+func (d *Desk) handleGetOutFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := d.queue.Get(id); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	rel := r.PathValue("file")
+	if pathTraverses(rel) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid path"})
+		return
+	}
+	base := filepath.Join(d.dataDir, "jobs", id, "out")
+	p := filepath.Join(base, filepath.Clean(rel))
+	if !strings.HasPrefix(p, base+string(filepath.Separator)) && p != base {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid path"})
+		return
+	}
+	if _, err := os.Stat(p); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "output file not yet written"})
+		return
+	}
+	http.ServeFile(w, r, p)
+}
+
 func (d *Desk) handleQueueStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, d.queue.Stats())
+}
+
+func defaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "deskbox-data")
+	}
+	return filepath.Join(home, ".local", "share", "deskbox")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

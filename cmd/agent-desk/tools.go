@@ -18,6 +18,7 @@ type Tool struct {
 	Input              *Schema       `yaml:"input,omitempty"` // what agents may send
 	Output             OutputSpec    `yaml:"output"`          // what agents get back
 	AllowedSideEffects SideEffects   `yaml:"allowed_side_effects"`
+	Sandbox            SandboxSpec   `yaml:"sandbox,omitempty"`
 	Execution          ExecutionSpec `yaml:"execution"`
 
 	dir     string // on-disk location
@@ -32,6 +33,15 @@ type OutputSpec struct {
 type SideEffects struct {
 	Files   []string `yaml:"files" json:"files"`   // empty = no file writes allowed
 	Network bool     `yaml:"network" json:"network"` // true = egress allowed
+}
+
+// SandboxSpec declares the per-job workspace surface. Inside the bwrap layer
+// the tool sees ONLY the files in `in` (read-only, one by one) and the `out`
+// dir (writable, host-tailable). If empty, the desk materializes input.json
+// in in/ and accepts stdout as the result channel.
+type SandboxSpec struct {
+	In  []string `yaml:"in"  json:"in"`  // exact files the pull needs (ro)
+	Out []string `yaml:"out" json:"out"` // files the tool may write (rw, tail-able)
 }
 
 type ExecutionSpec struct {
