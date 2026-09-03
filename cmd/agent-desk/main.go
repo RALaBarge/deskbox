@@ -32,7 +32,7 @@ func NewDesk(tools map[string]*Tool, q *Queue, dataDir string) *Desk {
 func main() {
 	addr := flag.String("addr", ":8080", "listen address (host:port)")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
-	workerCount := flag.Int("workers", 2, "number of queued-execution workers")
+	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
 	postgresDSN := flag.String("postgres-dsn", os.Getenv("DESKBOX_POSTGRES_DSN"),
 		"Postgres DSN for durable jobs + idempotency_key dedup (optional; unset = in-memory only)")

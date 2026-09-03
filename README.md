@@ -154,7 +154,7 @@ must be bound alongside `/usr` or the ELF interpreter can't resolve and
 ```bash
 # requires Go 1.22+ (installed in this env at ~/.local/bin/go)
 go build -o bin/agent-desk ./cmd/agent-desk
-./bin/agent-desk -addr :8080 -workers 2        # -tools defaults to ./tools
+./bin/agent-desk -addr :8080                   # -workers defaults to 10, -tools to ./tools
 ```
 
 Demo tools included: `example-tool` (file protocol — input gate, retry,
