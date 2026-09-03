@@ -21,13 +21,12 @@ deskbox/
 │   │   ├── executor.go      # scratch-dir sandbox, bwrap, side-effect audit
 │   │   └── store.go         # optional Postgres: durable jobs, idempotency_key
 │   └── tcs-verify/          # (stub) Rust CLI for offline spec checking
-└── tools/                   # the space agents read, each tool owns its
-    ├── example-tool/        #   tcs.yaml (contract)
-    │   ├── tcs.yaml         #   run.sh  (implementation)
-    │   ├── run.sh           #   README.md (skill notes for agents)
-    │   └── README.md
-    └── net-probe/           # proves egress cutting works
+└── tools/                   # the space agents read, each tool owns a folder:
+    └── <name>/              #   tcs.yaml (contract), run.sh (implementation),
+                              #   README.md (skill notes for agents)
 ```
+
+No tools ship in this repo yet. `tools/` is where you drop your own.
 
 A folder is a tool iff it contains `tcs.yaml` + an executable `run.sh|run.py|run`.
 
@@ -158,9 +157,8 @@ go build -o bin/agent-desk ./cmd/agent-desk
 ./bin/agent-desk -addr :8080                   # -workers defaults to 10, -tools to ./tools
 ```
 
-Demo tools included: `example-tool` (file protocol: input gate, retry,
-undeclared-write violation, live tail, host-privacy peek) and `net-probe`
-(stdio protocol: proves egress is cut).
+No demo tools ship in this repo. Write a `tcs.yaml` + `run.sh` under
+`tools/<name>/` following the conventions above and the desk will pick it up.
 
 ## Idempotency (Postgres, optional)
 
