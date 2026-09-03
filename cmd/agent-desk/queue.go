@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -23,18 +24,19 @@ const (
 // agent polls; the desk keeps the history in memory so the contract story is
 // auditable ("what did the agent try, and why did it not conform?").
 type Job struct {
-	ID         string         `json:"id"`
-	Tool       string         `json:"tool"`
-	Input      map[string]any `json:"input"`
-	Meta       map[string]any `json:"meta,omitempty"`
-	Status     JobStatus      `json:"status"`
-	Attempt    int            `json:"attempt"`
-	MaxRetries int            `json:"max_retries"`
-	Result     any            `json:"result,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	Created    time.Time      `json:"created"`
-	Started    *time.Time     `json:"started,omitempty"`
-	Finished   *time.Time     `json:"finished,omitempty"`
+	ID             string         `json:"id"`
+	Tool           string         `json:"tool"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+	Input          map[string]any `json:"input"`
+	Meta           map[string]any `json:"meta,omitempty"`
+	Status         JobStatus      `json:"status"`
+	Attempt        int            `json:"attempt"`
+	MaxRetries     int            `json:"max_retries"`
+	Result         any            `json:"result,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Created        time.Time      `json:"created"`
+	Started        *time.Time     `json:"started,omitempty"`
+	Finished       *time.Time     `json:"finished,omitempty"`
 }
 
 type Queue struct {
@@ -45,9 +47,10 @@ type Queue struct {
 	workers int
 	stop    chan struct{}
 	wg      sync.WaitGroup
+	store   *Store // optional: nil means in-memory only, no idempotency across restarts
 }
 
-func NewQueue(workers int) *Queue {
+func NewQueue(workers int, store *Store) *Queue {
 	if workers < 1 {
 		workers = 1
 	}
@@ -56,7 +59,33 @@ func NewQueue(workers int) *Queue {
 		ch:      make(chan *Job, 256),
 		workers: workers,
 		stop:    make(chan struct{}),
+		store:   store,
 	}
+}
+
+// Resume reloads jobs left "queued" or "running" by a prior process
+// lifetime and re-enqueues them, so a desk restart resumes work instead of
+// silently dropping it. No-op when no store is configured.
+func (q *Queue) Resume() (int, error) {
+	if q.store == nil {
+		return 0, nil
+	}
+	pending, err := q.store.LoadIncomplete()
+	if err != nil {
+		return 0, err
+	}
+	for _, job := range pending {
+		job.Status = StatusQueued
+		q.mu.Lock()
+		q.jobs[job.ID] = job
+		q.mu.Unlock()
+		select {
+		case q.ch <- job:
+		case <-q.stop:
+			return len(pending), errors.New("queue stopped during resume")
+		}
+	}
+	return len(pending), nil
 }
 
 func (q *Queue) Start() {
@@ -71,12 +100,30 @@ func (q *Queue) Stop() {
 	q.wg.Wait()
 }
 
-func (q *Queue) Submit(tool *Tool, input, meta map[string]any) (*Job, error) {
+func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey string) (*Job, error) {
 	job := &Job{
-		ID: newJobID(), Tool: tool.Name, Input: input, Meta: meta,
+		ID: newJobID(), Tool: tool.Name, IdempotencyKey: idempotencyKey,
+		Input: input, Meta: meta,
 		Status: StatusQueued, MaxRetries: tool.Execution.MaxRetries,
 		Created: time.Now().UTC(),
 	}
+
+	if q.store != nil {
+		existing, created, err := q.store.Insert(job, idempotencyKey)
+		if err != nil {
+			return nil, fmt.Errorf("persist job: %w", err)
+		}
+		if !created {
+			// Same (tool, idempotency_key) already has a job — whatever its
+			// current status, that's the one true result. Do not run again.
+			q.mu.Lock()
+			q.jobs[existing.ID] = existing
+			q.mu.Unlock()
+			return existing, nil
+		}
+		job = existing // canonical row as Postgres stored it
+	}
+
 	q.mu.Lock()
 	q.jobs[job.ID] = job
 	q.mu.Unlock()
@@ -90,9 +137,19 @@ func (q *Queue) Submit(tool *Tool, input, meta map[string]any) (*Job, error) {
 
 func (q *Queue) Get(id string) (*Job, bool) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	j, ok := q.jobs[id]
-	return j, ok
+	q.mu.Unlock()
+	if ok || q.store == nil {
+		return j, ok
+	}
+	stored, found, err := q.store.Get(id)
+	if err != nil || !found {
+		return nil, false
+	}
+	q.mu.Lock()
+	q.jobs[stored.ID] = stored
+	q.mu.Unlock()
+	return stored, true
 }
 
 func (q *Queue) worker() {
@@ -119,6 +176,7 @@ func (q *Queue) process(job *Job) {
 	job.Attempt++
 	job.Started = &now
 	q.mu.Unlock()
+	q.persist(job)
 
 	result, err := q.desk.Execute(tool, job, job.Input)
 
@@ -136,6 +194,7 @@ func (q *Queue) process(job *Job) {
 		job.Status = StatusQueued
 		job.Error = err.Error()
 		q.mu.Unlock()
+		q.persist(job)
 		time.Sleep(backoff)
 		select {
 		case q.ch <- job:
@@ -151,15 +210,27 @@ func (q *Queue) process(job *Job) {
 func (q *Queue) finish(job *Job, result any, err error) {
 	now := time.Now().UTC()
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	job.Finished = &now
 	if err != nil {
 		job.Status = StatusFailed
 		job.Error = err.Error()
+	} else {
+		job.Status = StatusDone
+		job.Result = result
+	}
+	q.mu.Unlock()
+	q.persist(job)
+}
+
+// persist is best-effort: a Postgres hiccup must not take down job
+// execution, only degrade the desk's ability to resume after a restart.
+func (q *Queue) persist(job *Job) {
+	if q.store == nil {
 		return
 	}
-	job.Status = StatusDone
-	job.Result = result
+	if err := q.store.Update(job); err != nil {
+		log.Printf("job %s: persist to postgres failed: %v", job.ID, err)
+	}
 }
 
 func (q *Queue) Stats() map[string]any {

@@ -34,6 +34,8 @@ func main() {
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 2, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
+	postgresDSN := flag.String("postgres-dsn", os.Getenv("DESKBOX_POSTGRES_DSN"),
+		"Postgres DSN for durable jobs + idempotency_key dedup (optional; unset = in-memory only)")
 	flag.Parse()
 
 	tools, err := LoadTools(*toolsDir)
@@ -48,11 +50,30 @@ func main() {
 		log.Printf("sandbox: WARNING bubblewrap NOT found — network:false enforced as advisory only")
 	}
 
-	q := NewQueue(*workerCount)
+	var store *Store
+	if *postgresDSN != "" {
+		s, err := NewStore(*postgresDSN)
+		if err != nil {
+			log.Fatalf("postgres: %v", err)
+		}
+		defer s.Close()
+		store = s
+		log.Printf("postgres: connected — jobs are durable, idempotency_key is enforced")
+	} else {
+		log.Printf("postgres: not configured — jobs are in-memory only, no idempotency across restarts")
+	}
+
+	q := NewQueue(*workerCount, store)
 	q.Start()
 	defer q.Stop()
 
 	d := NewDesk(tools, q, *dataDir)
+
+	if n, err := q.Resume(); err != nil {
+		log.Printf("resume from postgres: %v", err)
+	} else if n > 0 {
+		log.Printf("resume from postgres: re-enqueued %d incomplete job(s)", n)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", d.handleStatus)
@@ -112,6 +133,10 @@ func (d *Desk) handleGetTool(w http.ResponseWriter, r *http.Request) {
 type submitRequest struct {
 	Input map[string]any `json:"input"`
 	Meta  map[string]any `json:"meta,omitempty"`
+	// IdempotencyKey, when set, makes a repeated submit for this tool a no-op:
+	// the desk returns the existing job instead of running the tool again.
+	// Requires -postgres-dsn; ignored (never deduped) without it.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +168,7 @@ func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tool.Execution.IsQueued() {
-		job, err := d.queue.Submit(tool, req.Input, req.Meta)
+		job, err := d.queue.Submit(tool, req.Input, req.Meta, req.IdempotencyKey)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return

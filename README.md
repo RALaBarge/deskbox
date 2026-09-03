@@ -19,7 +19,8 @@ deskbox/
 │   │   ├── tools.go         # TCS loading + tool discovery
 │   │   ├── validator.go     # JSON-schema subset validator
 │   │   ├── queue.go         # worker pool, retries, job history
-│   │   └── executor.go      # scratch-dir sandbox, bwrap, side-effect audit
+│   │   ├── executor.go      # scratch-dir sandbox, bwrap, side-effect audit
+│   │   └── store.go         # optional Postgres: durable jobs, idempotency_key
 │   └── tcs-verify/          # (stub) Rust CLI for offline spec checking
 └── tools/                   # the space agents read — each tool owns its
     ├── example-tool/        #   tcs.yaml (contract)
@@ -87,7 +88,7 @@ minItems/maxItems, enum, minLength/maxLength, minimum/maximum`.
 | `GET /` | Service status + queue summary |
 | `GET /tools` | List tools + their contracts (what an agent may invoke) |
 | `GET /tools/{name}` | Raw `tcs.yaml` — the contract to conform to |
-| `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}}` |
+| `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}, "idempotency_key": "..."}` |
 | `GET /jobs/{id}` | Poll job status / result / error |
 | `GET /jobs/{id}/out/{file}` | Tail a job's output file (live while running) |
 | `GET /queue` | Queue depth, worker count, recent jobs |
@@ -160,12 +161,48 @@ Demo tools included: `example-tool` (file protocol — input gate, retry,
 undeclared-write violation, live tail, host-privacy peek) and `net-probe`
 (stdio protocol — proves egress is cut).
 
+## Idempotency (Postgres, optional)
+
+By default job state lives only in memory: a desk restart drops history, and
+two submits (e.g. an operator retrying after a dropped connection) run the
+tool twice. Point the desk at Postgres to fix both:
+
+```bash
+export DESKBOX_POSTGRES_DSN="postgres://user:pass@host:5432/deskbox?sslmode=disable"
+./bin/agent-desk -addr :8080          # or: -postgres-dsn "$DESKBOX_POSTGRES_DSN"
+```
+
+The desk creates its own `jobs` table on startup (`CREATE TABLE IF NOT
+EXISTS`, no migration tool needed). With Postgres configured:
+
+- **Dedup.** Pass `idempotency_key` in the submit body. A repeated submit for
+  the same `(tool, idempotency_key)` returns the existing job — whatever its
+  current status — instead of running the tool again:
+  ```bash
+  curl -X POST localhost:8080/tools/example-tool \
+    -d '{"input": {"message": "hello"}, "idempotency_key": "operator-run-42"}'
+  # first call: 202, status queued/running/done
+  # any later call with the same key: 202, the SAME job id, tool not re-run
+  ```
+  No key = no dedup, same as today (a fresh job every time).
+- **Resume.** On startup the desk reloads every job left `queued` or
+  `running` by a prior process (crash, redeploy, `kill -9`) and re-enqueues
+  it, so in-flight work isn't silently dropped. This is why the resume
+  behavior and the idempotency key share one mechanism: both answer "did
+  this already happen?" from the same durable row instead of trusting
+  in-memory state that a restart just erased.
+
+Without `-postgres-dsn` / `DESKBOX_POSTGRES_DSN` set, the desk behaves exactly
+as before — in-memory only, `idempotency_key` accepted but ignored.
+
 ## Status / roadmap
 
 - [x] TCS loading, input gate, output schema, out/ file-write audit
 - [x] Queued execution, worker pool, retries with backoff, job history
 - [x] Minimal per-job bwrap layer: only declared in/ + out/ visible, no host
       mounts, controlled env, live-tailable output files + HTTP tail endpoint
+- [x] Durable job log + idempotency (Postgres, optional): `idempotency_key`
+      dedup, resume of `queued`/`running` jobs after a crash/restart
 - [ ] `tcs-verify` Rust CLI (offline spec linting) — stub only
-- [ ] Persistent job log (SQLite) + auth token for the desk
+- [ ] Auth token for the desk
 - [ ] pi plugin: operator agent that talks to the desk (the original idea)
