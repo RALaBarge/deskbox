@@ -47,10 +47,10 @@ type Queue struct {
 	workers int
 	stop    chan struct{}
 	wg      sync.WaitGroup
-	store   *Store // optional: nil means in-memory only, no idempotency across restarts
+	store   JobStore // optional: nil means in-memory only, no idempotency across restarts
 }
 
-func NewQueue(workers int, store *Store) *Queue {
+func NewQueue(workers int, store JobStore) *Queue {
 	if workers < 1 {
 		workers = 1
 	}
@@ -130,7 +130,7 @@ func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey st
 			q.mu.Unlock()
 			return &cp, nil
 		}
-		job = existing // canonical row as Postgres stored it
+		job = existing // canonical row as the store persisted it
 	}
 
 	q.mu.Lock()
@@ -157,7 +157,7 @@ func (q *Queue) snapshot(job *Job) *Job {
 }
 
 // Get looks up a job. The error return is non-nil only for an actual store
-// failure (e.g. Postgres unreachable) — callers must not fold that into "not
+// failure (e.g. the store unreachable) — callers must not fold that into "not
 // found": an agent polling a real job during a DB blip needs to see that the
 // lookup failed, not that its job vanished.
 func (q *Queue) Get(id string) (*Job, bool, error) {
@@ -172,7 +172,7 @@ func (q *Queue) Get(id string) (*Job, bool, error) {
 	}
 	stored, found, err := q.store.Get(id)
 	if err != nil {
-		log.Printf("job %s: lookup in postgres failed: %v", id, err)
+		log.Printf("job %s: lookup in store failed: %v", id, err)
 		return nil, false, err
 	}
 	if !found {
@@ -259,14 +259,14 @@ func (q *Queue) finish(job *Job, result any, err error) {
 	q.persist(job)
 }
 
-// persist is best-effort: a Postgres hiccup must not take down job
-// execution, only degrade the desk's ability to resume after a restart.
+// persist is best-effort: a store hiccup must not take down job execution,
+// only degrade the desk's ability to resume after a restart.
 func (q *Queue) persist(job *Job) {
 	if q.store == nil {
 		return
 	}
 	if err := q.store.Update(job); err != nil {
-		log.Printf("job %s: persist to postgres failed: %v", job.ID, err)
+		log.Printf("job %s: persist to store failed: %v", job.ID, err)
 	}
 }
 

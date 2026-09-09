@@ -19,7 +19,9 @@ deskbox/
 │   │   ├── validator.go     # JSON-schema subset validator
 │   │   ├── queue.go         # worker pool, retries, job history
 │   │   ├── executor.go      # scratch-dir sandbox, bwrap, side-effect audit
-│   │   └── store.go         # optional Postgres: durable jobs, idempotency_key
+│   │   ├── store.go         # JobStore interface (pluggable durable backend)
+│   │   ├── store_sqlite.go  # default backend: one file, no server
+│   │   └── store_postgres.go # optional: shared job state across desk instances
 │   └── tcs-verify/          # (stub) Rust CLI for offline spec checking
 └── tools/                   # the space agents read, each tool owns a folder:
     └── <name>/              #   tcs.yaml (contract), run.sh (implementation),
@@ -179,7 +181,9 @@ DESKBOX_AUTH_TOKEN=some-long-random-string
 |---|---|
 | `DESKBOX_AUTH_ENABLED` | `true` to require a bearer token on every request. Default off. |
 | `DESKBOX_AUTH_TOKEN` | The token clients must send as `Authorization: Bearer <token>`. Required if auth is enabled. |
-| `DESKBOX_POSTGRES_DSN` | Same as `-postgres-dsn` below; the flag wins if both are set. |
+| `DESKBOX_STORE` | Same as `-store` below (`sqlite` \| `postgres` \| `memory`); the flag wins if both are set. Default `sqlite`. |
+| `DESKBOX_SQLITE_PATH` | Same as `-sqlite-path` below; the flag wins if both are set. |
+| `DESKBOX_POSTGRES_DSN` | Same as `-postgres-dsn` below; the flag wins if both are set. Only read when `-store=postgres`. |
 | `DESKBOX_JOB_MEMORY_MAX` | Per-job memory cap (systemd `MemoryMax` syntax, e.g. `512M`). Default `512M`. |
 | `DESKBOX_JOB_TASKS_MAX` | Per-job cap on forked processes/threads (systemd `TasksMax`), stops fork bombs. Default `64`. |
 
@@ -207,21 +211,30 @@ so the session persists independent of any active login, then restart the
 desk. If `systemd-run` isn't usable at all, the desk detects that (once at
 startup, and again if it stops working mid-run) and disables the wrapper
 instead of failing every job — logged clearly either way, same as the
-`bwrap`-missing and Postgres-unset cases.
+`bwrap`-missing and store-unset cases.
 
-## Idempotency (Postgres, optional)
+## Idempotency and durable jobs (`JobStore`, pluggable)
 
-By default job state lives only in memory. A desk restart drops history, and
-two submits (e.g. an operator retrying after a dropped connection) run the
-tool twice. Point the desk at Postgres to fix both:
+Job persistence sits behind a `JobStore` interface (`cmd/agent-desk/store.go`):
+`Insert`, `Update`, `Get`, `LoadIncomplete`, `Close`. Two implementations
+ship in this repo; `-store` picks one, and nothing else in the desk knows or
+cares which:
+
+| `-store` | Backend | When to use it |
+|---|---|---|
+| `sqlite` (default) | one file, `<data>/deskbox.db` unless `-sqlite-path` overrides it | the normal case: one desk, one box, no server to run |
+| `postgres` | needs `-postgres-dsn` / `DESKBOX_POSTGRES_DSN` | more than one desk instance sharing job state over the network |
+| `memory` | none — job history and idempotency don't survive a restart | quick/throwaway runs |
 
 ```bash
-export DESKBOX_POSTGRES_DSN="postgres://user:pass@host:5432/deskbox?sslmode=disable"
-./bin/agent-desk -addr :8080          # or: -postgres-dsn "$DESKBOX_POSTGRES_DSN"
+./bin/agent-desk -addr :8080                              # sqlite at ./data/deskbox.db
+./bin/agent-desk -addr :8080 -sqlite-path /var/lib/deskbox/jobs.db
+./bin/agent-desk -addr :8080 -store postgres -postgres-dsn "postgres://user:pass@host:5432/deskbox?sslmode=disable"
+./bin/agent-desk -addr :8080 -store memory
 ```
 
-The desk creates its own `jobs` table on startup (`CREATE TABLE IF NOT
-EXISTS`, no migration tool needed). With Postgres configured:
+Both backends create their own `jobs` table/file on startup (`CREATE TABLE IF
+NOT EXISTS`, no migration tool needed). With `sqlite` or `postgres`:
 
 - **Dedup.** Pass `idempotency_key` in the submit body. A repeated submit for
   the same `(tool, idempotency_key)` returns the existing job, whatever its
@@ -237,8 +250,13 @@ EXISTS`, no migration tool needed). With Postgres configured:
   `running` by a prior process (crash, redeploy, `kill -9`) and re-enqueues
   it. In-flight work isn't dropped on restart.
 
-Without `-postgres-dsn` / `DESKBOX_POSTGRES_DSN` set, the desk behaves exactly
-as before: in-memory only, `idempotency_key` accepted but ignored.
+With `-store memory` (or no store configured), the desk behaves as before:
+in-memory only, `idempotency_key` accepted but ignored.
+
+Want a different backend — Redis, MySQL, a flat file, whatever you actually
+run? Implement `JobStore` and pass your type to `NewQueue` instead; the
+queue, the HTTP handlers, and everything else in the desk only ever call
+through the interface.
 
 ## Status / roadmap
 
@@ -246,8 +264,9 @@ as before: in-memory only, `idempotency_key` accepted but ignored.
 - [x] Queued execution, worker pool, retries with backoff, job history
 - [x] Minimal per-job bwrap layer: only declared in/ + out/ visible, no host
       mounts, controlled env, live-tailable output files + HTTP tail endpoint
-- [x] Durable job log + idempotency (Postgres, optional): `idempotency_key`
-      dedup, resume of `queued`/`running` jobs after a crash/restart
+- [x] Durable job log + idempotency behind a pluggable `JobStore`: SQLite by
+      default, Postgres opt-in, `idempotency_key` dedup, resume of
+      `queued`/`running` jobs after a crash/restart
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [x] Auth token for the desk (optional, `.env`-driven, see Settings above)
 - [x] Per-job memory/task-count cgroup limits (`systemd-run --user --scope`,

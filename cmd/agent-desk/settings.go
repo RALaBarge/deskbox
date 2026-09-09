@@ -14,6 +14,8 @@ import (
 type Settings struct {
 	AuthEnabled bool
 	AuthToken   string
+	StoreKind   string // "sqlite" (default) | "postgres" | "memory"
+	SQLitePath  string // empty = <data-dir>/deskbox.db
 	PostgresDSN string
 
 	// Per-job cgroup limits (via systemd-run --scope). bwrap's namespaces
@@ -82,9 +84,16 @@ func LoadSettings() (*Settings, error) {
 		tasksMax = n
 	}
 
+	storeKind := os.Getenv("DESKBOX_STORE")
+	if storeKind == "" {
+		storeKind = "sqlite"
+	}
+
 	return &Settings{
 		AuthEnabled:  authEnabled,
 		AuthToken:    os.Getenv("DESKBOX_AUTH_TOKEN"),
+		StoreKind:    storeKind,
+		SQLitePath:   os.Getenv("DESKBOX_SQLITE_PATH"),
 		PostgresDSN:  os.Getenv("DESKBOX_POSTGRES_DSN"),
 		JobMemoryMax: memMax,
 		JobTasksMax:  tasksMax,

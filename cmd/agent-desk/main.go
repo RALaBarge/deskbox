@@ -51,8 +51,11 @@ func main() {
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
+	storeKind := flag.String("store", settings.StoreKind, "durable job backend: sqlite (default) | postgres | memory")
+	sqlitePath := flag.String("sqlite-path", settings.SQLitePath,
+		"SQLite file for durable jobs + idempotency_key dedup (default: <data>/deskbox.db)")
 	postgresDSN := flag.String("postgres-dsn", settings.PostgresDSN,
-		"Postgres DSN for durable jobs + idempotency_key dedup (optional; unset = in-memory only)")
+		"Postgres DSN for durable jobs + idempotency_key dedup (only used with -store=postgres)")
 	flag.Parse()
 
 	if settings.AuthEnabled && settings.AuthToken == "" {
@@ -85,17 +88,41 @@ func main() {
 			"job memory/task-count limits are NOT enforced")
 	}
 
-	var store *Store
-	if *postgresDSN != "" {
-		s, err := NewStore(*postgresDSN)
+	// JobStore is an interface (store.go): sqlite and postgres both ship
+	// here, but neither is privileged — any type satisfying JobStore can be
+	// passed to NewQueue instead.
+	var store JobStore
+	switch strings.ToLower(*storeKind) {
+	case "memory":
+		log.Printf("store: memory only — no idempotency or crash-resume across restarts")
+	case "postgres":
+		if *postgresDSN == "" {
+			log.Fatalf("-store=postgres requires -postgres-dsn (or DESKBOX_POSTGRES_DSN)")
+		}
+		s, err := NewPostgresStore(*postgresDSN)
 		if err != nil {
-			log.Fatalf("postgres: %v", err)
+			log.Fatalf("postgres store: %v", err)
 		}
 		defer s.Close()
 		store = s
-		log.Printf("postgres: connected — jobs are durable, idempotency_key is enforced")
-	} else {
-		log.Printf("postgres: not configured — jobs are in-memory only, no idempotency across restarts")
+		log.Printf("store: postgres — jobs are durable, idempotency_key is enforced")
+	case "sqlite", "":
+		path := *sqlitePath
+		if path == "" {
+			path = filepath.Join(*dataDir, "deskbox.db")
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			log.Fatalf("sqlite store: create dir for %s: %v", path, err)
+		}
+		s, err := NewSQLiteStore(path)
+		if err != nil {
+			log.Fatalf("sqlite store: %v", err)
+		}
+		defer s.Close()
+		store = s
+		log.Printf("store: sqlite (%s) — jobs are durable, idempotency_key is enforced", path)
+	default:
+		log.Fatalf("-store=%q not recognized (sqlite | postgres | memory)", *storeKind)
 	}
 
 	q := NewQueue(*workerCount, store)
@@ -105,9 +132,9 @@ func main() {
 	d := NewDesk(tools, q, *dataDir, settings, resourceLimitsOK)
 
 	if n, err := q.Resume(); err != nil {
-		log.Printf("resume from postgres: %v", err)
+		log.Printf("resume from store: %v", err)
 	} else if n > 0 {
-		log.Printf("resume from postgres: re-enqueued %d incomplete job(s)", n)
+		log.Printf("resume from store: re-enqueued %d incomplete job(s)", n)
 	}
 
 	mux := http.NewServeMux()
@@ -197,7 +224,7 @@ type submitRequest struct {
 	Meta  map[string]any `json:"meta,omitempty"`
 	// IdempotencyKey, when set, makes a repeated submit for this tool a no-op:
 	// the desk returns the existing job instead of running the tool again.
-	// Requires -postgres-dsn; ignored (never deduped) without it.
+	// Ignored (never deduped) with -store=memory.
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
