@@ -113,6 +113,19 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 	return tools, nil
 }
 
+// AsJSON re-decodes the tool's raw tcs.yaml generically (not through the Tool
+// struct, so no field the struct doesn't know about is silently dropped) for
+// serving over the API. Authoring stays YAML (tcs.yaml on disk); everything
+// an agent reads or sends over the wire — this included — is JSON, no
+// exceptions to remember.
+func (t *Tool) AsJSON() (map[string]any, error) {
+	var generic map[string]any
+	if err := yaml.Unmarshal(t.raw, &generic); err != nil {
+		return nil, err
+	}
+	return generic, nil
+}
+
 func resolveRunScript(dir string) (string, error) {
 	for _, cand := range []string{"run.sh", "run.py", "run"} {
 		p := filepath.Join(dir, cand)

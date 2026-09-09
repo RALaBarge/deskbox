@@ -173,16 +173,23 @@ func (d *Desk) handleListTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleGetTool returns the raw TCS yaml — the contract an agent must conform
-// to before it is allowed to invoke this tool.
+// handleGetTool returns the TCS contract an agent must conform to before it
+// is allowed to invoke this tool. tcs.yaml is the authoring format on disk;
+// every response this API sends is JSON with no exceptions, so it's
+// re-decoded generically (not through the Tool struct, so no field the
+// struct doesn't model is silently dropped) rather than served as raw YAML.
 func (d *Desk) handleGetTool(w http.ResponseWriter, r *http.Request) {
 	t, ok := d.tools[r.PathValue("name")]
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "tool not found"})
 		return
 	}
-	w.Header().Set("Content-Type", "application/yaml")
-	w.Write(t.raw)
+	contract, err := t.AsJSON()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "contract failed to decode: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, contract)
 }
 
 type submitRequest struct {

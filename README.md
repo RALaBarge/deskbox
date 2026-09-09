@@ -85,7 +85,7 @@ minItems/maxItems, enum, minLength/maxLength, minimum/maximum`.
 |---|---|
 | `GET /` | Service status + queue summary |
 | `GET /tools` | List tools + their contracts (what an agent may invoke) |
-| `GET /tools/{name}` | Raw `tcs.yaml`, the contract to conform to |
+| `GET /tools/{name}` | The tool's contract as JSON (authored as `tcs.yaml` on disk, re-decoded for the wire — every API response is JSON, no exceptions) |
 | `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}, "idempotency_key": "..."}` |
 | `GET /jobs/{id}` | Poll job status / result / error |
 | `GET /jobs/{id}/out/{file}` | Tail a job's output file (live while running) |
