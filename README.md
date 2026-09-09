@@ -102,8 +102,10 @@ properties:
 | `GET /` | Service status + queue summary |
 | `GET /tools` | List tools + their contracts (what an agent may invoke) |
 | `GET /tools/{name}` | The tool's contract as JSON (authored as `tcs.yaml` on disk, re-decoded for the wire — every API response is JSON, no exceptions) |
-| `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}, "idempotency_key": "..."}` |
+| `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}, "idempotency_key": "..."}`. Optional `?wait=<duration>` (e.g. `5s`) — see below. |
 | `GET /jobs/{id}` | Poll job status / result / error |
+| `GET /jobs/{id}/wait` | Long-poll: blocks until the job is terminal or `?timeout` elapses (default 25s) |
+| `DELETE /jobs/{id}` | Cancel a queued or running job |
 | `GET /jobs/{id}/out/{file}` | Tail a job's output file (live while running) |
 | `GET /queue` | Queue depth, worker count, recent jobs |
 
@@ -120,9 +122,53 @@ curl -X POST localhost:8080/tools/example-tool \
 # 202 {"id":"job-…","status":"queued",…}
 ```
 
-Poll `GET /jobs/{id}` until `status` is `done` (result present) or `failed`
+Poll `GET /jobs/{id}` until `status` is `done` (result present), `failed`
 (error explains why: retryable after max_retries, or a permanent contract
-violation, never retried).
+violation, never retried), or `canceled` (an operator's `DELETE`).
+
+### Waiting for a result instead of polling
+
+Every submission is persisted and queued the same way regardless of the
+tool's `execution.mode` — that setting only controls how long `POST`
+blocks before responding, not whether the job gets retries, idempotency
+dedup, or a durable record. Two ways to avoid a polling loop:
+
+- **`?wait=<duration>` on `POST /tools/{name}`.** Blocks up to that long for
+  the job to finish, returning `200` with the final job inline if it does,
+  or falling back to today's `202` + `Location` if it doesn't. Capped at
+  55s. Omit it (the default) for the original async-first behavior — no
+  blocking, immediate `202`.
+  ```bash
+  curl -X POST 'localhost:8080/tools/example-tool?wait=5s' -d '{"input": {"message": "hi"}}'
+  # 200 {"status":"done","result":{...}} if it finished within 5s, else 202 (poll from here)
+  ```
+- **`GET /jobs/{id}/wait?timeout=<duration>`** — the same long-poll, usable
+  any time after submit, not just on the initial call. Also capped at 55s.
+
+A tool declared `execution.mode: direct` always waits for its own result —
+that's what "direct" means — bounded by its own timeout × (max_retries+1)
+as a safety cap rather than by the caller. It goes through the exact same
+queue, worker pool, and store as a queued tool now; only the wait behavior
+differs. (This is a behavior change worth knowing: previously "direct" ran
+inline in the HTTP handler, bypassing `-workers`, retries, and the store
+entirely — a `direct` tool's own `max_retries` was silently ignored, and it
+was never queryable afterward via `GET /jobs/{id}`. Both are fixed now, at
+the cost of a direct call occasionally waiting on a free worker slot under
+heavy concurrent load, same as a queued one would.)
+
+### Canceling a job
+
+```bash
+curl -X DELETE localhost:8080/jobs/job-abc123
+# 200 {"status":"canceled",...} — queued: skipped before it ever ran;
+#                                  running: process killed via its context
+# 409 {"error":"job already done, nothing to cancel", ...} — already terminal
+# 404 — job doesn't exist
+```
+A canceled job's process is actually killed (`SIGKILL` via the run's
+context being canceled), not just marked canceled while left running in
+the background — confirmed with no orphaned process left behind after a
+mid-run cancel.
 
 A non-conforming request is rejected at the gate:
 
@@ -309,6 +355,10 @@ through the interface.
 - [x] Auth token for the desk (optional, `.env`-driven, see Settings above)
 - [x] Per-job memory/task-count cgroup limits (`systemd-run --user --scope`,
       fails open with a clear warning if the environment can't support it)
+- [x] Unified invoke: `direct` and `queued` both go through the same queue,
+      store, and retries; `?wait=`/`GET /jobs/{id}/wait` long-poll instead
+      of a tight polling loop; `DELETE /jobs/{id}` cancels a queued or
+      running job (process actually killed, not just marked)
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 
 ## License

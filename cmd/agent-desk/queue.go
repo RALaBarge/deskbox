@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -14,11 +15,19 @@ import (
 type JobStatus string
 
 const (
-	StatusQueued  JobStatus = "queued"
-	StatusRunning JobStatus = "running"
-	StatusDone    JobStatus = "done"
-	StatusFailed  JobStatus = "failed"
+	StatusQueued   JobStatus = "queued"
+	StatusRunning  JobStatus = "running"
+	StatusDone     JobStatus = "done"
+	StatusFailed   JobStatus = "failed"
+	StatusCanceled JobStatus = "canceled"
 )
+
+// isTerminal reports whether a job has reached a state that will never
+// change again — nothing further will run for it, and no future write
+// (retry, cancel) can move it out of this status.
+func (s JobStatus) isTerminal() bool {
+	return s == StatusDone || s == StatusFailed || s == StatusCanceled
+}
 
 // Job is one tool invocation flowing through the desk. Job IDs are what the
 // agent polls; the desk keeps the history in memory so the contract story is
@@ -48,6 +57,12 @@ type Queue struct {
 	stop    chan struct{}
 	wg      sync.WaitGroup
 	store   JobStore // optional: nil means in-memory only, no idempotency across restarts
+	// cancels holds the cancel func for every job currently *running* (not
+	// queued) — set right before Execute is called, deleted right after it
+	// returns. A queued job (sitting in ch, not yet picked up by a worker)
+	// has no entry here; Cancel() handles that case by flipping its status
+	// directly, and process() checks for that the moment it dequeues.
+	cancels map[string]context.CancelFunc
 }
 
 func NewQueue(workers int, store JobStore) *Queue {
@@ -60,6 +75,7 @@ func NewQueue(workers int, store JobStore) *Queue {
 		workers: workers,
 		stop:    make(chan struct{}),
 		store:   store,
+		cancels: map[string]context.CancelFunc{},
 	}
 }
 
@@ -202,15 +218,41 @@ func (q *Queue) process(job *Job) {
 		q.finish(job, nil, errors.New("tool not found"))
 		return
 	}
+
+	// Check-and-transition to Running, and register this attempt's cancel
+	// func, as one atomic critical section. Closing the gap between "am I
+	// canceled" and "I'm now running, here's how to cancel me" matters: a
+	// Cancel() landing in that gap would otherwise see neither a queued job
+	// it could flip directly nor a registered cancel func to call, and the
+	// tool would run to completion despite being canceled.
+	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now().UTC()
 	q.mu.Lock()
+	if job.Status == StatusCanceled {
+		q.mu.Unlock()
+		cancel()
+		q.finishCanceled(job)
+		return
+	}
 	job.Status = StatusRunning
 	job.Attempt++
 	job.Started = &now
+	q.cancels[job.ID] = cancel
 	q.mu.Unlock()
 	q.persist(job)
 
-	result, err := q.desk.Execute(tool, job, job.Input)
+	result, err := q.desk.Execute(ctx, tool, job, job.Input)
+
+	q.mu.Lock()
+	delete(q.cancels, job.ID)
+	canceled := job.Status == StatusCanceled
+	q.mu.Unlock()
+	cancel() // release the context's resources either way
+
+	if canceled {
+		q.finishCanceled(job)
+		return
+	}
 
 	switch {
 	case err == nil:
@@ -231,6 +273,17 @@ func (q *Queue) process(job *Job) {
 		case <-time.After(backoff):
 		case <-q.stop:
 			q.finish(job, nil, err)
+			return
+		}
+		// A cancel could have landed during the backoff sleep, while the job
+		// was sitting at StatusQueued with no registered cancel func (the
+		// previous attempt's was already deleted above). Check before
+		// re-enqueueing so a cancel requested mid-backoff isn't lost.
+		q.mu.Lock()
+		alreadyCanceled := job.Status == StatusCanceled
+		q.mu.Unlock()
+		if alreadyCanceled {
+			q.finishCanceled(job)
 			return
 		}
 		select {
@@ -257,6 +310,100 @@ func (q *Queue) finish(job *Job, result any, err error) {
 	}
 	q.mu.Unlock()
 	q.persist(job)
+}
+
+// finishCanceled records a job an explicit Cancel() call already marked
+// Canceled. It mirrors finish but never lets a done/failed result overwrite
+// the Canceled status — whatever the tool's process actually returned (if
+// it got a chance to return anything at all) is discarded.
+func (q *Queue) finishCanceled(job *Job) {
+	now := time.Now().UTC()
+	q.mu.Lock()
+	job.Finished = &now
+	job.Error = "canceled by operator"
+	q.mu.Unlock()
+	q.persist(job)
+}
+
+// Cancel marks a queued or running job Canceled. A queued job (still
+// sitting in ch, not yet picked up by a worker) is skipped the moment its
+// worker turn comes; a running job's process is killed via the context
+// Execute is running under. Returns (job, false, nil) if the job exists but
+// already reached a terminal state — nothing to cancel, not an error. A
+// job unknown to this process entirely (not tracked in memory, and either
+// no store configured or not found in it) returns (nil, false, nil).
+func (q *Queue) Cancel(id string) (*Job, bool, error) {
+	q.mu.Lock()
+	job, tracked := q.jobs[id]
+	if tracked {
+		if job.Status.isTerminal() {
+			cp := *job
+			q.mu.Unlock()
+			return &cp, false, nil
+		}
+		job.Status = StatusCanceled
+		cancelFn := q.cancels[id] // only set if currently running
+		cp := *job
+		q.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		q.persist(&cp)
+		return &cp, true, nil
+	}
+	q.mu.Unlock()
+
+	if q.store == nil {
+		return nil, false, nil
+	}
+	stored, found, err := q.store.Get(id)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return nil, false, nil
+	}
+	// Found only in the store, never in q.jobs: Resume() loads every
+	// queued/running job into q.jobs at startup, so anything reachable
+	// solely through the store is necessarily already terminal.
+	return stored, false, nil
+}
+
+// WaitForTerminal blocks until the job reaches a terminal state, the
+// deadline passes, or ctx is done (e.g. the caller's HTTP connection
+// dropped) — whichever comes first. Returns (nil, nil) if the job doesn't
+// exist at all, the same not-found-vs-store-error distinction Get() makes.
+// Implemented as an internal poll of the desk's own store/memory, not a
+// true completion broadcast — simple and correct, and at a 100ms tick the
+// caller-visible latency this adds is not worth a channel-based signal for
+// the volume this desk is built for.
+func (q *Queue) WaitForTerminal(ctx context.Context, id string, deadline time.Time) (*Job, error) {
+	const pollInterval = 100 * time.Millisecond
+	for {
+		job, ok, err := q.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		if job.Status.isTerminal() {
+			return job, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return job, nil
+		}
+		wait := pollInterval
+		if remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return job, nil
+		case <-time.After(wait):
+		}
+	}
 }
 
 // persist is best-effort: a store hiccup must not take down job execution,

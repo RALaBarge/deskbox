@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +16,13 @@ import (
 )
 
 const version = "0.1.0"
+
+// maxWait caps how long any single HTTP request (POST /tools/{name}?wait=,
+// GET /jobs/{id}/wait?timeout=) will block, so a caller can't hold a
+// connection open indefinitely by accident — and so the desk stays well
+// under typical reverse-proxy/load-balancer timeouts. A wait longer than
+// this needs actual polling (GET /jobs/{id}, or /wait again).
+const maxWait = 55 * time.Second
 
 // Desk is the enforcing proxy. Every tool invocation an agent makes must pass
 // through here, so the contract (TCS) is load-bearing: inputs are validated on
@@ -165,6 +173,8 @@ func main() {
 	mux.HandleFunc("GET /tools/{name}", d.handleGetTool)
 	mux.HandleFunc("POST /tools/{name}", d.handleSubmit)
 	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
+	mux.HandleFunc("GET /jobs/{id}/wait", d.handleWaitJob)
+	mux.HandleFunc("DELETE /jobs/{id}", d.handleCancelJob)
 	mux.HandleFunc("GET /jobs/{id}/out/{file...}", d.handleGetOutFile)
 	mux.HandleFunc("GET /queue", d.handleQueueStats)
 
@@ -250,6 +260,41 @@ type submitRequest struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
+// parseWait reads ?wait=<duration> (e.g. "5s", "500ms") for the unified
+// invoke path. Missing or empty is 0 — the original async-first behavior
+// for a queued tool: 202 + Location, no blocking. A positive value blocks
+// up to that long for the job to finish before falling back to 202,
+// clamped to maxWait so a caller can't hold the connection open forever by
+// accident. A "direct" tool ignores this entirely (see handleSubmit) — it
+// always waits for its own result, that's what declaring it direct means.
+func parseWait(r *http.Request) (time.Duration, error) {
+	raw := r.URL.Query().Get("wait")
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid wait duration %q: %w", raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("wait must not be negative")
+	}
+	if d > maxWait {
+		d = maxWait
+	}
+	return d, nil
+}
+
+// handleSubmit is the only way to run a tool. Every call is persisted and
+// queued the same way regardless of the tool's execution.mode — that
+// distinction now only controls how long this handler waits before
+// responding, not whether the job goes through the store, retries, or
+// idempotency dedup. (Previously "direct" ran inline in this handler,
+// bypassing the worker pool, retries, and the store entirely — a real
+// inconsistency: a direct tool's own max_retries was silently ignored, and
+// it wasn't governed by -workers like every other tool. Folding it into
+// the same path fixes that, at the cost of a direct call now possibly
+// waiting on a free worker slot under heavy load, same as a queued one.)
 func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	tool, ok := d.tools[name]
@@ -278,32 +323,101 @@ func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if tool.Execution.IsQueued() {
-		job, err := d.queue.Submit(tool, req.Input, req.Meta, req.IdempotencyKey)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
+	wait, err := parseWait(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	job, err := d.queue.Submit(tool, req.Input, req.Meta, req.IdempotencyKey)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	if !tool.Execution.IsQueued() {
+		// direct always waits for the final result, bounded by the tool's
+		// own timeout/retry budget as a safety cap — not caller-tunable.
+		wait = tool.Execution.MaxTotalDuration()
+	}
+	if wait <= 0 {
 		w.Header().Set("Location", "/jobs/"+job.ID)
 		writeJSON(w, http.StatusAccepted, job)
 		return
 	}
 
-	// mode: direct — run synchronously, no queue.
-	now := time.Now().UTC()
-	job := &Job{ID: newJobID(), Tool: tool.Name, Input: req.Input, Meta: req.Meta,
-		Status: StatusRunning, Attempt: 1, MaxRetries: tool.Execution.MaxRetries,
-		Created: now, Started: &now}
-	result, err := d.Execute(tool, job, req.Input)
+	final, err := d.queue.WaitForTerminal(r.Context(), job.ID, time.Now().Add(wait))
 	if err != nil {
-		job.Status = StatusFailed
-		job.Error = err.Error()
-	} else {
-		job.Status = StatusDone
-		job.Result = result
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
 	}
-	fin := time.Now().UTC()
-	job.Finished = &fin
+	w.Header().Set("Location", "/jobs/"+final.ID)
+	if final.Status.isTerminal() {
+		writeJSON(w, http.StatusOK, final)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, final) // still in flight when the wait elapsed
+}
+
+// handleWaitJob long-polls: blocks until the job reaches a terminal state
+// or ?timeout elapses (default 25s, capped at maxWait), instead of the
+// caller hammering GET /jobs/{id} in a tight loop.
+func (d *Desk) handleWaitJob(w http.ResponseWriter, r *http.Request) {
+	timeout := 25 * time.Second
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid timeout duration %q: %v", raw, err)})
+			return
+		}
+		if parsed < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout must not be negative"})
+			return
+		}
+		if parsed > maxWait {
+			parsed = maxWait
+		}
+		timeout = parsed
+	}
+
+	job, err := d.queue.WaitForTerminal(r.Context(), r.PathValue("id"), time.Now().Add(timeout))
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	if job.Status.isTerminal() {
+		writeJSON(w, http.StatusOK, job)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job) // still in flight when timeout elapsed
+}
+
+// handleCancelJob cancels a queued or running job. A queued job is skipped
+// the moment its worker turn comes; a running job's process is killed via
+// its context (see Queue.Cancel / Queue.process). A job that already
+// reached a terminal state is a 409, not an error — cancellation is a
+// no-op there, not a failure.
+func (d *Desk) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	job, canceled, err := d.queue.Cancel(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	if job == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+		return
+	}
+	if !canceled {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "job already " + string(job.Status) + ", nothing to cancel",
+			"job":   job,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, job)
 }
 

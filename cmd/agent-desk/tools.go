@@ -60,6 +60,16 @@ func (e ExecutionSpec) Timeout() time.Duration {
 	return time.Duration(e.TimeoutMS) * time.Millisecond
 }
 
+// MaxTotalDuration bounds how long the unified invoke path will ever wait
+// for a "direct" tool: one full timeout per attempt (the first run plus
+// every retry), plus slack for retry backoff. Not caller-tunable — direct
+// mode always waits for its own result, this just caps how long that can
+// possibly take before the desk gives up waiting and falls back to a job
+// id, same as a queued tool would.
+func (e ExecutionSpec) MaxTotalDuration() time.Duration {
+	return e.Timeout()*time.Duration(e.MaxRetries+1) + 5*time.Second
+}
+
 // LoadTools scans dir for tool folders. A folder is a tool iff it contains a
 // tcs.yaml and an executable run script.
 //

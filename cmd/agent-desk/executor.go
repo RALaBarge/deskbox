@@ -117,8 +117,13 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 //   - any file written to out/ that is NOT declared in sandbox.out is a
 //     contract violation (permanent, no retry)
 //   - non-zero exit or timeout => retryable failure
-func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tool.Execution.Timeout())
+//
+// parent is the caller's cancellation source — Queue.process derives a
+// per-job context from it and cancels that context when an operator DELETEs
+// the job, which kills the running process (exec.CommandContext) instead of
+// letting it run to completion after the desk stopped caring about it.
+func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[string]any) (any, error) {
+	ctx, cancel := context.WithTimeout(parent, tool.Execution.Timeout())
 	defer cancel()
 
 	// Job workspace is stable on disk (not tmp): the operator can tail -f the
@@ -199,6 +204,13 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
 
+	// Canceled (an operator's DELETE /jobs/{id}) is checked ahead of
+	// DeadlineExceeded so the returned error is accurate; Queue.process
+	// decides the job's final status from job.Status, not from this
+	// message, so this mainly matters for logging/debugging clarity.
+	if ctx.Err() == context.Canceled {
+		return nil, fmt.Errorf("canceled after %s", elapsed.Round(time.Millisecond))
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("timeout after %s", elapsed.Round(time.Millisecond))
 	}
