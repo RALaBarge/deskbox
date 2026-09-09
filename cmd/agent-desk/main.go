@@ -46,16 +46,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("settings: %v", err)
 	}
+	// deskbox.yaml: structural desk config a human edits and commits (unlike
+	// .env, which is gitignored and secret-only). A missing file changes
+	// nothing — every field below still has a working default.
+	cfg, err := LoadConfig("deskbox.yaml")
+	if err != nil {
+		log.Fatalf("deskbox.yaml: %v", err)
+	}
+
+	// Precedence for store selection, highest wins: explicit -store flag >
+	// DESKBOX_STORE env > deskbox.yaml's store.kind > hardcoded "sqlite".
+	// Each layer only overrides the next if it actually set something.
+	storeKindDefault := settings.StoreKind
+	if storeKindDefault == "" {
+		storeKindDefault = cfg.Store.Kind
+	}
+	if storeKindDefault == "" {
+		storeKindDefault = "sqlite"
+	}
+	sqlitePathDefault := settings.SQLitePath
+	if sqlitePathDefault == "" {
+		sqlitePathDefault = cfg.Store.SQLite.Path
+	}
 
 	addr := flag.String("addr", ":8080", "listen address (host:port)")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
-	storeKind := flag.String("store", settings.StoreKind, "durable job backend: sqlite (default) | postgres | memory")
-	sqlitePath := flag.String("sqlite-path", settings.SQLitePath,
+	storeKind := flag.String("store", storeKindDefault, "durable job backend: sqlite (default) | postgres | memory")
+	sqlitePath := flag.String("sqlite-path", sqlitePathDefault,
 		"SQLite file for durable jobs + idempotency_key dedup (default: <data>/deskbox.db)")
 	postgresDSN := flag.String("postgres-dsn", settings.PostgresDSN,
-		"Postgres DSN for durable jobs + idempotency_key dedup (only used with -store=postgres)")
+		"Postgres DSN for durable jobs + idempotency_key dedup (only used with -store=postgres; secret, keep it in .env, not deskbox.yaml)")
 	flag.Parse()
 
 	if settings.AuthEnabled && settings.AuthToken == "" {

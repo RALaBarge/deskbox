@@ -1,0 +1,12 @@
+# deskbox.yaml — structural desk config: edit this by hand, commit it.
+# Secrets (a Postgres DSN with a password, the auth token) belong in .env
+# instead, which is gitignored — never put those here.
+#
+# Every field below has a working built-in default; this file only needs to
+# name what you want to change. Deleting it entirely is fine too — the desk
+# runs on defaults with no deskbox.yaml at all.
+
+store:
+  kind: sqlite   # sqlite (default) | postgres | memory
+  sqlite:
+    path: ""     # "" = <data-dir>/deskbox.db (see -data / -sqlite-path)

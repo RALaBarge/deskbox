@@ -190,6 +190,30 @@ DESKBOX_AUTH_TOKEN=some-long-random-string
 `.env` is gitignored. Never commit a real token, generate one per
 deployment (`openssl rand -hex 32` works fine).
 
+## Config (`deskbox.yaml`, optional)
+
+`.env` is for secrets and is gitignored. `deskbox.yaml` is the opposite:
+structural, non-secret desk settings meant to be hand-edited and checked
+into version control — the same role `tcs.yaml` plays for a tool's
+contract, one level up. The desk reads it once at startup from the working
+directory; a missing file changes nothing, every setting still has a
+working default.
+
+```yaml
+# deskbox.yaml
+store:
+  kind: sqlite   # sqlite (default) | postgres | memory
+  sqlite:
+    path: ""     # "" = <data-dir>/deskbox.db
+```
+
+Precedence, highest wins, each layer only overrides the next if it actually
+set something: **`-store`/`-sqlite-path` flag** > **`DESKBOX_STORE`/
+`DESKBOX_SQLITE_PATH` env** > **`deskbox.yaml`** > hardcoded default
+(`sqlite`). A Postgres DSN is never read from `deskbox.yaml` — it typically
+carries a password, so it stays in `.env`/`-postgres-dsn` only, kept out of
+the file you commit.
+
 ### Per-job resource limits
 
 `bwrap`'s namespaces isolate what a tool can *see*; they don't cap what it

@@ -84,15 +84,13 @@ func LoadSettings() (*Settings, error) {
 		tasksMax = n
 	}
 
-	storeKind := os.Getenv("DESKBOX_STORE")
-	if storeKind == "" {
-		storeKind = "sqlite"
-	}
-
 	return &Settings{
-		AuthEnabled:  authEnabled,
-		AuthToken:    os.Getenv("DESKBOX_AUTH_TOKEN"),
-		StoreKind:    storeKind,
+		AuthEnabled: authEnabled,
+		AuthToken:   os.Getenv("DESKBOX_AUTH_TOKEN"),
+		// StoreKind/SQLitePath are left "" when unset — main.go falls back
+		// to deskbox.yaml and then the hardcoded default, in that order, so
+		// an env var must actually be set to win at this layer.
+		StoreKind:    os.Getenv("DESKBOX_STORE"),
 		SQLitePath:   os.Getenv("DESKBOX_SQLITE_PATH"),
 		PostgresDSN:  os.Getenv("DESKBOX_POSTGRES_DSN"),
 		JobMemoryMax: memMax,
