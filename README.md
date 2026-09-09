@@ -71,7 +71,21 @@ execution:
 ```
 
 Schema subset: `type, required, properties, additionalProperties, items,
-minItems/maxItems, enum, minLength/maxLength, minimum/maximum`.
+minItems/maxItems, enum, minLength/maxLength, minimum/maximum, oneOf, anyOf`.
+Deliberately not supported: `pattern`/`format`/`$ref`/`allOf`/`const`.
+Pattern matching especially is left to the tool itself — a regex validator
+in the gate is complexity (YAML-escaping quirks, ReDoS exposure) a tool's
+own language already handles better downstream. `oneOf`/`anyOf` are
+structural (which shape is this?) rather than content-level, so those stay
+in the gate; a schema using either is the entire check for that node — it
+doesn't compose with a sibling `type` keyword, e.g.:
+```yaml
+properties:
+  amount:
+    oneOf:
+      - { type: integer }
+      - { type: string, enum: ["unspecified"] }
+```
 
 ## Tool conventions (the files in the space)
 
