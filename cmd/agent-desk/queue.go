@@ -344,8 +344,18 @@ func (q *Queue) finish(job *Job, result any, err error) {
 		job.Status = StatusDone
 		job.Result = result
 	}
+	// Copy under the lock, persist the copy — same pattern Cancel/Ack
+	// already use. Persisting the shared *job pointer directly (the old
+	// code) let a concurrent Ack() race this write: store.Update read the
+	// pointer's fields with no lock, so an Ack() landing in that window
+	// could have its acked=true committed and then silently overwritten
+	// by this call finishing its own (older) write after — the store ends
+	// up thinking the job is unacked forever. persist no longer touches
+	// acked/acked_at at all (see Queue.Ack), which closes the same class
+	// of hazard from the other direction too.
+	cp := *job
 	q.mu.Unlock()
-	q.persist(job)
+	q.persist(&cp)
 }
 
 // finishCanceled records a job an explicit Cancel() call already marked
@@ -357,8 +367,9 @@ func (q *Queue) finishCanceled(job *Job) {
 	q.mu.Lock()
 	job.Finished = &now
 	job.Error = "canceled by operator"
+	cp := *job
 	q.mu.Unlock()
-	q.persist(job)
+	q.persist(&cp)
 }
 
 // Cancel marks a queued or running job Canceled. A queued job (still
@@ -378,6 +389,17 @@ func (q *Queue) Cancel(id string) (*Job, bool, error) {
 			return &cp, false, nil
 		}
 		job.Status = StatusCanceled
+		// A job canceled while still queued never goes through
+		// finish/finishCanceled, so without this it reaches a terminal
+		// state with Finished left nil — breaking anything that sorts or
+		// orders by finish time (ListTerminalUnacked's most-recent-first).
+		// A running job's cancel still gets a more precise timestamp
+		// shortly after, when finishCanceled runs post-Execute and
+		// overwrites this.
+		if job.Finished == nil {
+			now := time.Now().UTC()
+			job.Finished = &now
+		}
 		cancelFn := q.cancels[id] // only set if currently running
 		cp := *job
 		q.mu.Unlock()
@@ -459,14 +481,17 @@ func (q *Queue) Ack(id string) (*Job, error) {
 			q.mu.Unlock()
 			return nil, errJobNotTerminal
 		}
-		if !job.Acked {
+		wasAcked := job.Acked
+		if !wasAcked {
 			now := time.Now().UTC()
 			job.Acked = true
 			job.AckedAt = &now
 		}
 		cp := *job
 		q.mu.Unlock()
-		q.persist(&cp)
+		if !wasAcked {
+			q.persistAck(&cp)
+		}
 		return &cp, nil
 	}
 	q.mu.Unlock()
@@ -488,7 +513,7 @@ func (q *Queue) Ack(id string) (*Job, error) {
 		now := time.Now().UTC()
 		stored.Acked = true
 		stored.AckedAt = &now
-		if err := q.store.Update(stored); err != nil {
+		if err := q.store.Ack(id, now); err != nil {
 			return nil, err
 		}
 	}
@@ -511,17 +536,23 @@ func (q *Queue) ListTerminalUnacked(limit int) ([]*Job, error) {
 			out = append(out, &cp)
 		}
 	}
-	sort.Slice(out, func(i, k int) bool {
-		fi, fk := out[i].Finished, out[k].Finished
-		if fi == nil || fk == nil {
-			return false
-		}
-		return fi.After(*fk)
-	})
+	sort.Slice(out, func(i, k int) bool { return jobSortTime(out[i]).After(jobSortTime(out[k])) })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// jobSortTime is the timestamp ListTerminalUnacked orders by: Finished
+// when set, falling back to Created. A nil Finished isn't just a
+// theoretical case — comparing against nil in a sort.Slice less-func is
+// not a strict weak ordering (nil reads as "equal" to everything), which
+// silently misorders results rather than erroring.
+func jobSortTime(j *Job) time.Time {
+	if j.Finished != nil {
+		return *j.Finished
+	}
+	return j.Created
 }
 
 // ListByBatch returns every job submitted as part of the given batch, in
@@ -581,6 +612,23 @@ func (q *Queue) persist(job *Job) {
 	}
 	if err := q.store.Update(job); err != nil {
 		log.Printf("job %s: persist to store failed: %v", job.ID, err)
+	}
+}
+
+// persistAck writes only the ack flag, via JobStore.Ack — a narrow update
+// deliberately kept separate from persist/Update. Update persists a job's
+// lifecycle fields (status, result, timestamps); Ack persists operator
+// acknowledgment. Sharing one write path between "the worker finished this
+// job" and "the operator acked this job" is exactly what let one clobber
+// the other (see the comment in finish/finishCanceled) — keeping them
+// wire-separate means neither write can ever contain a stale copy of the
+// other's field.
+func (q *Queue) persistAck(job *Job) {
+	if q.store == nil {
+		return
+	}
+	if err := q.store.Ack(job.ID, *job.AckedAt); err != nil {
+		log.Printf("job %s: persist ack to store failed: %v", job.ID, err)
 	}
 }
 

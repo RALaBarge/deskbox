@@ -161,12 +161,19 @@ func resolveRunScript(dir string) (string, error) {
 // user by design — enforcing it is a deployment choice (a dedicated
 // service account owning tools/), not something the desk can force here.
 func warnIfBypassable(path string, fi os.FileInfo) {
-	if fi.Mode().Perm()&0o011 != 0 { // group-execute or other-execute
-		log.Printf("WARN: %s is executable by group/other (mode %04o) — "+
+	// Read, not just execute, is enough to bypass a run.sh/run.py: `bash
+	// run.sh` or `python3 run.py` only needs to open and read the file,
+	// the interpreter is what actually executes. Checking execute bits
+	// alone (0o011) misses that — a 0644 script would pass silently while
+	// still being fully bypassable by anyone who can read it. 0o055 checks
+	// group/other read OR execute together.
+	if fi.Mode().Perm()&0o055 != 0 {
+		log.Printf("WARN: %s is readable or executable by group/other (mode %04o) — "+
 			"anyone on this box other than the script's owner can run it "+
-			"directly, bypassing every contract check. If that matters for "+
-			"your deployment, chmod 700 it (or chown tools/ to a dedicated "+
-			"service account that only the desk runs as).",
+			"directly, or via its interpreter (read access alone is enough "+
+			"for a shell/python script), bypassing every contract check. If "+
+			"that matters for your deployment, chmod 700 it (or chown "+
+			"tools/ to a dedicated service account that only the desk runs as).",
 			path, fi.Mode().Perm())
 	}
 }

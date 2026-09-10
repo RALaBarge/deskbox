@@ -1,6 +1,9 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // JobStore is the durable job backend the desk enforces idempotency and
 // crash-resume through. Postgres and SQLite both ship in this repo, but
@@ -14,8 +17,15 @@ type JobStore interface {
 	// for execution — the desk already has (or had) this exact call in
 	// flight.
 	Insert(job *Job, idempotencyKey string) (existing *Job, created bool, err error)
-	// Update persists the current state of an already-inserted job.
+	// Update persists a job's lifecycle fields (status, attempt, result,
+	// error, started/finished). Deliberately does NOT touch acked/acked_at
+	// — see Ack — so a lifecycle write (a worker finishing the job) can
+	// never race and clobber an operator's concurrent acknowledgment, or
+	// vice versa.
 	Update(job *Job) error
+	// Ack persists the operator's acknowledgment of a terminal job's
+	// result, and only that — kept wire-separate from Update on purpose.
+	Ack(id string, at time.Time) error
 	// Get looks up one job by id.
 	Get(id string) (*Job, bool, error)
 	// LoadIncomplete returns every job left "queued" or "running" from a

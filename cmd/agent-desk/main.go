@@ -560,13 +560,26 @@ func (d *Desk) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batchID, jobs, err := d.queue.SubmitBatch(tool, items, req.Meta)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
 	jobIDs := make([]string, len(jobs))
 	for i, j := range jobs {
 		jobIDs[i] = j.ID
+	}
+	if err != nil {
+		// Every item already validated above, so this is a real store
+		// failure partway through the fan-out — items before it are
+		// already persisted and queued, not lost, and must not be. Return
+		// their ids rather than discarding them: without batch_id/job_ids
+		// here, a caller has no way to find and reconcile jobs that are
+		// already running under a batch it was never told about, and its
+		// only visible move (resubmit) would duplicate them (batch items
+		// carry no idempotency key of their own).
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":         err.Error(),
+			"batch_id":      batchID,
+			"job_ids":       jobIDs,
+			"items_pending": len(items) - len(jobs),
+		})
+		return
 	}
 	w.Header().Set("Location", "/batches/"+batchID)
 	writeJSON(w, http.StatusAccepted, map[string]any{

@@ -161,15 +161,25 @@ func (s *SQLiteStore) Update(job *Job) error {
 		return fmt.Errorf("marshal result: %w", err)
 	}
 	const q = `
-UPDATE jobs SET status=?, attempt=?, result=?, error=?, started_at=?, finished_at=?, acked=?, acked_at=?
+UPDATE jobs SET status=?, attempt=?, result=?, error=?, started_at=?, finished_at=?
 WHERE id=?
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx, q,
 		job.Status, job.Attempt, nullableJSONText(resultJSON), nullableString(job.Error),
-		nullableTime(job.Started), nullableTime(job.Finished), job.Acked, nullableTime(job.AckedAt),
-		job.ID)
+		nullableTime(job.Started), nullableTime(job.Finished), job.ID)
+	return err
+}
+
+// Ack persists the operator's acknowledgment, and only that — deliberately
+// wire-separate from Update so a lifecycle write (a worker finishing a
+// job) can never race and clobber this, or vice versa.
+func (s *SQLiteStore) Ack(id string, at time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, "UPDATE jobs SET acked = 1, acked_at = ? WHERE id = ?",
+		at.UTC().Format(timeLayout), id)
 	return err
 }
 
@@ -227,7 +237,7 @@ func (s *SQLiteStore) ListTerminalUnacked(limit int) ([]*Job, error) {
 	defer cancel()
 	const q = sqliteSelectCols + `
 FROM jobs WHERE acked = 0 AND status IN ('done', 'failed', 'canceled')
-ORDER BY finished_at DESC LIMIT ?
+ORDER BY COALESCE(finished_at, created_at) DESC LIMIT ?
 `
 	rows, err := s.db.QueryContext(ctx, q, limit)
 	if err != nil {

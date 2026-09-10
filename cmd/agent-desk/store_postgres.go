@@ -108,21 +108,33 @@ RETURNING ` + postgresSelectCols + `, (xmax = 0) AS inserted`
 	return got, inserted, nil
 }
 
-// Update persists the current state of an already-inserted job.
+// Update persists a job's lifecycle fields. Deliberately does not touch
+// acked/acked_at — see Ack — so a lifecycle write (a worker finishing the
+// job) can never race and clobber an operator's concurrent acknowledgment.
 func (s *PostgresStore) Update(job *Job) error {
 	resultJSON, err := marshalNullable(job.Result)
 	if err != nil {
 		return fmt.Errorf("marshal result: %w", err)
 	}
 	const q = `
-UPDATE jobs SET status=$2, attempt=$3, result=$4::jsonb, error=$5, started_at=$6, finished_at=$7, acked=$8, acked_at=$9
+UPDATE jobs SET status=$2, attempt=$3, result=$4::jsonb, error=$5, started_at=$6, finished_at=$7
 WHERE id=$1
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx, q,
 		job.ID, job.Status, job.Attempt, resultJSON, nullableString(job.Error),
-		job.Started, job.Finished, job.Acked, job.AckedAt)
+		job.Started, job.Finished)
+	return err
+}
+
+// Ack persists the operator's acknowledgment, and only that — deliberately
+// wire-separate from Update so a lifecycle write (a worker finishing a
+// job) can never race and clobber this, or vice versa.
+func (s *PostgresStore) Ack(id string, at time.Time) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, "UPDATE jobs SET acked = true, acked_at = $2 WHERE id = $1", id, at)
 	return err
 }
 
@@ -173,7 +185,7 @@ func (s *PostgresStore) ListTerminalUnacked(limit int) ([]*Job, error) {
 	}
 	q := `SELECT ` + postgresSelectCols + ` FROM jobs
 WHERE acked = false AND status IN ('done', 'failed', 'canceled')
-ORDER BY finished_at DESC LIMIT $1`
+ORDER BY COALESCE(finished_at, created_at) DESC LIMIT $1`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, q, limit)
