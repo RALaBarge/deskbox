@@ -1,10 +1,55 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TestRequeueNeverBlocks guards the deadlock a review turned up: workers
+// used to re-enqueue their own retries with a direct send on q.ch, so once
+// ch filled (256) with every worker stuck in that same send, nothing was
+// left to drain it — permanent deadlock. Enqueueing far past ch's capacity
+// with nothing receiving must now return promptly instead of blocking; the
+// backlog absorbs it and the dispatcher hands it off as workers free up.
+func TestRequeueNeverBlocks(t *testing.T) {
+	q := NewQueue(1, nil) // deliberately NOT started: nothing drains ch
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ { // ~4x ch's capacity
+			if err := q.requeue(&Job{ID: "job-backlog", Status: StatusQueued}); err != nil {
+				t.Errorf("requeue %d failed: %v", i, err)
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("requeue blocked past ch capacity — the retry-path deadlock is back")
+	}
+}
+
+// TestEnqueueRefusesWhenFull checks the other half: admission is capped, so
+// a runaway submitter gets a fast, visible refusal instead of unbounded
+// backlog growth.
+func TestEnqueueRefusesWhenFull(t *testing.T) {
+	q := NewQueue(1, nil)
+	for i := 0; i < maxPending; i++ {
+		if err := q.enqueue(&Job{ID: "job-fill", Status: StatusQueued}); err != nil {
+			t.Fatalf("enqueue %d should have been admitted: %v", i, err)
+		}
+	}
+	if err := q.enqueue(&Job{ID: "job-over", Status: StatusQueued}); !errors.Is(err, errQueueFull) {
+		t.Fatalf("expected errQueueFull past the cap, got %v", err)
+	}
+	// Already-accepted work still gets through — the cap is admission-only.
+	if err := q.requeue(&Job{ID: "job-retry", Status: StatusQueued}); err != nil {
+		t.Fatalf("requeue must bypass the admission cap, got %v", err)
+	}
+}
 
 // TestAckFinishNoRace guards the bug a review turned up: finish/
 // finishCanceled used to persist the shared *Job pointer directly, so a

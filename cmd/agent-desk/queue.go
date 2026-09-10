@@ -60,6 +60,19 @@ type Job struct {
 	AckedAt *time.Time `json:"acked_at,omitempty"`
 }
 
+// maxPending caps the admission backlog — jobs accepted but not yet handed
+// to a worker. Past this, new submits are refused with errQueueFull (HTTP
+// 503) rather than growing memory without limit. Work the desk has already
+// accepted (retries, resume-after-restart) bypasses the cap: backpressure
+// belongs at admission, and dropping a job already promised to a caller
+// would be worse than the memory.
+const maxPending = 10000
+
+var (
+	errQueueFull    = errors.New("queue is full, too many jobs waiting for a worker")
+	errQueueStopped = errors.New("queue stopped")
+)
+
 type Queue struct {
 	mu      sync.Mutex
 	desk    *Desk
@@ -69,6 +82,18 @@ type Queue struct {
 	stop    chan struct{}
 	wg      sync.WaitGroup
 	store   JobStore // optional: nil means in-memory only, no idempotency across restarts
+	// pending is the unbounded-by-design backlog between "accepted" and
+	// "handed to a worker", drained by the single dispatch() goroutine —
+	// the only sender on ch. Nothing else may send on ch: a worker that
+	// re-enqueued its own retry directly could block forever once ch
+	// filled, with every other worker stuck doing the same, and no worker
+	// left to drain it. Routing every enqueue through here means neither a
+	// worker nor an HTTP handler ever blocks on a full channel.
+	pending []*Job
+	// wake signals dispatch() that pending grew. Buffered(1) and sent
+	// non-blockingly: one pending signal is enough, since dispatch
+	// re-checks the whole backlog under the lock on every loop.
+	wake chan struct{}
 	// cancels holds the cancel func for every job currently *running* (not
 	// queued) — set right before Execute is called, deleted right after it
 	// returns. A queued job (sitting in ch, not yet picked up by a worker)
@@ -87,7 +112,78 @@ func NewQueue(workers int, store JobStore) *Queue {
 		workers: workers,
 		stop:    make(chan struct{}),
 		store:   store,
+		wake:    make(chan struct{}, 1),
 		cancels: map[string]context.CancelFunc{},
+	}
+}
+
+// enqueue admits a new job to the backlog. Never blocks: it either appends
+// (and signals the dispatcher) or refuses outright when the backlog is at
+// maxPending.
+func (q *Queue) enqueue(job *Job) error { return q.push(job, true) }
+
+// requeue puts already-accepted work back on the backlog — a retry, or a
+// job reloaded after a restart. Never blocks and never refuses: the desk
+// already told someone this job exists.
+func (q *Queue) requeue(job *Job) error { return q.push(job, false) }
+
+func (q *Queue) push(job *Job, admit bool) error {
+	select {
+	case <-q.stop:
+		return errQueueStopped
+	default:
+	}
+
+	q.mu.Lock()
+	if admit && len(q.pending) >= maxPending {
+		q.mu.Unlock()
+		return errQueueFull
+	}
+	q.pending = append(q.pending, job)
+	q.mu.Unlock()
+
+	select {
+	case q.wake <- struct{}{}:
+	default: // a wake is already pending; dispatch will see this job anyway
+	}
+	return nil
+}
+
+// dispatch is the only sender on ch. It moves jobs from the pending backlog
+// into the channel one at a time, blocking only where blocking is safe:
+// waiting for a worker to be free, with q.stop as an escape.
+func (q *Queue) dispatch() {
+	defer q.wg.Done()
+	for {
+		q.mu.Lock()
+		var job *Job
+		if len(q.pending) > 0 {
+			job = q.pending[0]
+			q.pending[0] = nil // let the job be collected once handed off
+			q.pending = q.pending[1:]
+			if len(q.pending) == 0 {
+				q.pending = nil // drop the drained backing array
+			}
+		}
+		q.mu.Unlock()
+
+		if job == nil {
+			select {
+			case <-q.wake:
+			case <-q.stop:
+				return
+			}
+			continue
+		}
+
+		select {
+		case q.ch <- job:
+		case <-q.stop:
+			// Shutting down mid-handoff. The job stays "queued" in the
+			// store, so Resume() picks it up on the next start — the same
+			// crash-resume path every other in-flight job relies on.
+			return
+		}
 	}
 }
 
@@ -107,16 +203,16 @@ func (q *Queue) Resume() (int, error) {
 		q.mu.Lock()
 		q.jobs[job.ID] = job
 		q.mu.Unlock()
-		select {
-		case q.ch <- job:
-		case <-q.stop:
-			return len(pending), errors.New("queue stopped during resume")
+		if err := q.requeue(job); err != nil {
+			return len(pending), fmt.Errorf("queue stopped during resume: %w", err)
 		}
 	}
 	return len(pending), nil
 }
 
 func (q *Queue) Start() {
+	q.wg.Add(1)
+	go q.dispatch()
 	for i := 0; i < q.workers; i++ {
 		q.wg.Add(1)
 		go q.worker()
@@ -188,12 +284,10 @@ func (q *Queue) submit(tool *Tool, input, meta map[string]any, idempotencyKey, b
 	q.mu.Lock()
 	q.jobs[job.ID] = job
 	q.mu.Unlock()
-	select {
-	case q.ch <- job:
-		return q.snapshot(job), nil
-	case <-q.stop:
-		return nil, errors.New("queue stopped")
+	if err := q.enqueue(job); err != nil {
+		return nil, err
 	}
+	return q.snapshot(job), nil
 }
 
 // snapshot copies a Job's current field values under the queue's lock. A
@@ -322,9 +416,12 @@ func (q *Queue) process(job *Job) {
 			q.finishCanceled(job)
 			return
 		}
-		select {
-		case q.ch <- job:
-		case <-q.stop:
+		// requeue, never a direct send on ch: a worker blocking here while
+		// every other worker does the same is exactly the deadlock this
+		// path used to be able to reach once ch filled up. On shutdown the
+		// job is finished with the failure that triggered the retry, not
+		// with the shutdown error — that's the outcome worth recording.
+		if requeueErr := q.requeue(job); requeueErr != nil {
 			q.finish(job, nil, err)
 		}
 	default:

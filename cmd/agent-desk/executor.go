@@ -349,7 +349,16 @@ func canScopeJobs() bool {
 	if _, err := exec.LookPath("systemd-run"); err != nil {
 		return false
 	}
-	cmd := exec.Command("systemd-run", "--user", "--scope", "--quiet",
+	// Bounded: this probe runs in main() before the HTTP server starts
+	// listening, so an unbounded Run() here means a wedged D-Bus session
+	// (which can hang rather than fail fast) stops the desk from ever
+	// serving, with no signal to the operator beyond a silent hang. A
+	// probe that should take milliseconds gets five seconds; past that,
+	// treat it as unusable and fail open, exactly like a probe that
+	// returned an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemd-run", "--user", "--scope", "--quiet",
 		"-p", "MemoryMax=16M", "--", "/bin/true")
 	return cmd.Run() == nil
 }

@@ -337,6 +337,16 @@ func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job, err := d.queue.Submit(tool, req.Input, req.Meta, req.IdempotencyKey)
+	if errors.Is(err, errQueueFull) {
+		// Real backpressure, and an honest answer: the desk refuses fast
+		// rather than blocking the caller's connection until a worker frees
+		// up (what a bounded channel send used to do) or growing the
+		// backlog without limit. Retry-After tells a well-behaved operator
+		// to come back rather than hammer.
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -565,15 +575,20 @@ func (d *Desk) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		jobIDs[i] = j.ID
 	}
 	if err != nil {
-		// Every item already validated above, so this is a real store
-		// failure partway through the fan-out — items before it are
+		// Every item already validated above, so this is a store failure or
+		// a full queue partway through the fan-out — items before it are
 		// already persisted and queued, not lost, and must not be. Return
 		// their ids rather than discarding them: without batch_id/job_ids
 		// here, a caller has no way to find and reconcile jobs that are
 		// already running under a batch it was never told about, and its
 		// only visible move (resubmit) would duplicate them (batch items
 		// carry no idempotency key of their own).
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
+		status := http.StatusInternalServerError
+		if errors.Is(err, errQueueFull) {
+			status = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", "5")
+		}
+		writeJSON(w, status, map[string]any{
 			"error":         err.Error(),
 			"batch_id":      batchID,
 			"job_ids":       jobIDs,
