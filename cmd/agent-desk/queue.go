@@ -33,19 +33,31 @@ func (s JobStatus) isTerminal() bool {
 // agent polls; the desk keeps the history in memory so the contract story is
 // auditable ("what did the agent try, and why did it not conform?").
 type Job struct {
-	ID             string         `json:"id"`
-	Tool           string         `json:"tool"`
-	IdempotencyKey string         `json:"idempotency_key,omitempty"`
-	Input          map[string]any `json:"input"`
-	Meta           map[string]any `json:"meta,omitempty"`
-	Status         JobStatus      `json:"status"`
-	Attempt        int            `json:"attempt"`
-	MaxRetries     int            `json:"max_retries"`
-	Result         any            `json:"result,omitempty"`
-	Error          string         `json:"error,omitempty"`
-	Created        time.Time      `json:"created"`
-	Started        *time.Time     `json:"started,omitempty"`
-	Finished       *time.Time     `json:"finished,omitempty"`
+	ID             string `json:"id"`
+	Tool           string `json:"tool"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	// BatchID is set only for a job created via SubmitBatch — every item in
+	// one POST /batches call shares it, so GET /batches/{id} can find them
+	// all. Empty for an ordinary single POST /tools/{name} submit.
+	BatchID    string         `json:"batch_id,omitempty"`
+	Input      map[string]any `json:"input"`
+	Meta       map[string]any `json:"meta,omitempty"`
+	Status     JobStatus      `json:"status"`
+	Attempt    int            `json:"attempt"`
+	MaxRetries int            `json:"max_retries"`
+	Result     any            `json:"result,omitempty"`
+	Error      string         `json:"error,omitempty"`
+	Created    time.Time      `json:"created"`
+	Started    *time.Time     `json:"started,omitempty"`
+	Finished   *time.Time     `json:"finished,omitempty"`
+	// Acked marks a terminal job's result as seen/handled by the operator —
+	// the inbox model (GET /jobs lists terminal+unacked, POST
+	// /jobs/{id}/ack clears one) that replaces claim/TTL-based delivery:
+	// with one desk process instead of many independent ones, multiple
+	// readers seeing the same unacked job is harmless, so this is a plain
+	// flag, not a claim.
+	Acked   bool       `json:"acked"`
+	AckedAt *time.Time `json:"acked_at,omitempty"`
 }
 
 type Queue struct {
@@ -117,9 +129,33 @@ func (q *Queue) Stop() {
 }
 
 func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey string) (*Job, error) {
+	return q.submit(tool, input, meta, idempotencyKey, "")
+}
+
+// SubmitBatch fans out one job per item under a shared batch id — the
+// first-class replacement for lease-based chunk claiming. There is one
+// worker (the desk itself), and jobs already resume via Resume/
+// LoadIncomplete after a crash, so "what happens if the worker dies
+// mid-batch" is exactly the existing per-job lifecycle: nothing new to
+// invent for a lease to expire out of. No idempotency dedup per item —
+// each item is its own fresh job.
+func (q *Queue) SubmitBatch(tool *Tool, items []map[string]any, meta map[string]any) (string, []*Job, error) {
+	batchID := newBatchID()
+	jobs := make([]*Job, 0, len(items))
+	for _, item := range items {
+		job, err := q.submit(tool, item, meta, "", batchID)
+		if err != nil {
+			return batchID, jobs, err
+		}
+		jobs = append(jobs, job)
+	}
+	return batchID, jobs, nil
+}
+
+func (q *Queue) submit(tool *Tool, input, meta map[string]any, idempotencyKey, batchID string) (*Job, error) {
 	job := &Job{
 		ID: newJobID(), Tool: tool.Name, IdempotencyKey: idempotencyKey,
-		Input: input, Meta: meta,
+		BatchID: batchID, Input: input, Meta: meta,
 		Status: StatusQueued, MaxRetries: tool.Execution.MaxRetries,
 		Created: time.Now().UTC(),
 	}
@@ -406,6 +442,137 @@ func (q *Queue) WaitForTerminal(ctx context.Context, id string, deadline time.Ti
 	}
 }
 
+var (
+	errJobNotFound    = errors.New("job not found")
+	errJobNotTerminal = errors.New("job has not reached a terminal state yet, nothing to ack")
+)
+
+// Ack marks a terminal job's result seen/handled by the operator — the
+// other half of the inbox model (ListTerminalUnacked is the inbox; Ack
+// empties it one item at a time). Acking an already-acked job is a no-op,
+// not an error; acking a non-terminal job returns errJobNotTerminal.
+func (q *Queue) Ack(id string) (*Job, error) {
+	q.mu.Lock()
+	job, tracked := q.jobs[id]
+	if tracked {
+		if !job.Status.isTerminal() {
+			q.mu.Unlock()
+			return nil, errJobNotTerminal
+		}
+		if !job.Acked {
+			now := time.Now().UTC()
+			job.Acked = true
+			job.AckedAt = &now
+		}
+		cp := *job
+		q.mu.Unlock()
+		q.persist(&cp)
+		return &cp, nil
+	}
+	q.mu.Unlock()
+
+	if q.store == nil {
+		return nil, errJobNotFound
+	}
+	stored, found, err := q.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errJobNotFound
+	}
+	if !stored.Status.isTerminal() {
+		return nil, errJobNotTerminal
+	}
+	if !stored.Acked {
+		now := time.Now().UTC()
+		stored.Acked = true
+		stored.AckedAt = &now
+		if err := q.store.Update(stored); err != nil {
+			return nil, err
+		}
+	}
+	return stored, nil
+}
+
+// ListTerminalUnacked returns terminal jobs the operator hasn't acked yet —
+// the inbox. Store-backed (authoritative, survives restarts) when a store
+// is configured; falls back to scanning in-memory jobs under -store=memory.
+func (q *Queue) ListTerminalUnacked(limit int) ([]*Job, error) {
+	if q.store != nil {
+		return q.store.ListTerminalUnacked(limit)
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []*Job
+	for _, j := range q.jobs {
+		if j.Status.isTerminal() && !j.Acked {
+			cp := *j
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, k int) bool {
+		fi, fk := out[i].Finished, out[k].Finished
+		if fi == nil || fk == nil {
+			return false
+		}
+		return fi.After(*fk)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListByBatch returns every job submitted as part of the given batch, in
+// submission order. Store-backed when configured, same fallback as above.
+func (q *Queue) ListByBatch(batchID string) ([]*Job, error) {
+	if q.store != nil {
+		return q.store.ListByBatch(batchID)
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []*Job
+	for _, j := range q.jobs {
+		if j.BatchID == batchID {
+			cp := *j
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, k int) bool { return out[i].Created.Before(out[k].Created) })
+	return out, nil
+}
+
+// WaitForAnyTerminal blocks until at least one terminal-and-unacked job
+// exists, the deadline passes, or ctx is done — the zero-latency half of
+// the inbox model: park one request here instead of polling
+// ListTerminalUnacked yourself in a loop.
+func (q *Queue) WaitForAnyTerminal(ctx context.Context, deadline time.Time) ([]*Job, error) {
+	const pollInterval = 100 * time.Millisecond
+	for {
+		jobs, err := q.ListTerminalUnacked(50)
+		if err != nil {
+			return nil, err
+		}
+		if len(jobs) > 0 {
+			return jobs, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return jobs, nil
+		}
+		wait := pollInterval
+		if remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return jobs, nil
+		case <-time.After(wait):
+		}
+	}
+}
+
 // persist is best-effort: a store hiccup must not take down job execution,
 // only degrade the desk's ability to resume after a restart.
 func (q *Queue) persist(job *Job) {
@@ -451,4 +618,10 @@ func newJobID() string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
 	return "job-" + hex.EncodeToString(b)
+}
+
+func newBatchID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return "batch-" + hex.EncodeToString(b)
 }

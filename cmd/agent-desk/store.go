@@ -22,6 +22,13 @@ type JobStore interface {
 	// prior process lifetime, so a desk restart resumes work instead of
 	// silently dropping or duplicating it.
 	LoadIncomplete() ([]*Job, error)
+	// ListTerminalUnacked returns terminal jobs (done/failed/canceled) the
+	// operator hasn't acked yet, most-recently-finished first — the inbox
+	// behind GET /jobs and GET /jobs/wait-any.
+	ListTerminalUnacked(limit int) ([]*Job, error)
+	// ListByBatch returns every job submitted under the given batch id, in
+	// submission order — backs GET /batches/{id}.
+	ListByBatch(batchID string) ([]*Job, error)
 	Close() error
 }
 

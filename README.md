@@ -95,6 +95,33 @@ properties:
 4. Files a tool may write are declared in `allowed_side_effects.files`.
 5. `network: false` means no egress. Enforced by bubblewrap, not the code.
 
+### Can the contract be skipped by just running the script directly?
+
+Nothing in the desk itself stops someone from running `tools/<name>/run.sh`
+by hand instead of going through the API — that's not a gap a single HTTP
+server can close by watching for it (a harness-specific interception layer
+only catches that one harness; a plain shell walks right past it). What
+*does* close it is the same thing that keeps everything else off the tool's
+sandbox: OS file permissions. At load time the desk warns if a run script
+is executable by group or other:
+
+```
+WARN: tools/example-tool/run.sh is executable by group/other (mode 0755) —
+anyone on this box other than the script's owner can run it directly,
+bypassing every contract check. If that matters for your deployment, chmod
+700 it (or chown tools/ to a dedicated service account that only the desk
+runs as).
+```
+
+On a single-user dev machine — the primary case this repo is built for,
+where your own shell and the desk run as the same account — that warning
+is just informational; the guarantee doesn't really apply when "the
+operator's shell" and "the desk" are the same user by design. Where it
+matters (a shared box, an operator you don't fully trust), `chmod 700` the
+scripts or `chown` `tools/` to a dedicated account that only the desk
+process runs as, and the warning goes away because the permission itself
+now enforces it.
+
 ## API
 
 | Endpoint | Purpose |
@@ -107,6 +134,11 @@ properties:
 | `GET /jobs/{id}/wait` | Long-poll: blocks until the job is terminal or `?timeout` elapses (default 25s) |
 | `DELETE /jobs/{id}` | Cancel a queued or running job |
 | `GET /jobs/{id}/out/{file}` | Tail a job's output file (live while running) |
+| `GET /jobs` | The inbox: terminal jobs not yet acked. Optional `?limit` (default 50). |
+| `GET /jobs/wait-any` | Long-poll the inbox: blocks until at least one job is terminal-and-unacked, or `?timeout` elapses (default 25s) |
+| `POST /jobs/{id}/ack` | Mark a terminal job's result seen/handled — empties it from the inbox |
+| `POST /batches` | Fan out one job per item. Body: `{"tool": "...", "items": [{...}, {...}], "meta": {...}}` |
+| `GET /batches/{id}` | Batch progress: items done/total, broken down by status |
 | `GET /queue` | Queue depth, worker count, recent jobs |
 
 Each job gets a stable workspace at `<data>/jobs/<id>/` with `in/` and `out/`.
@@ -169,6 +201,53 @@ A canceled job's process is actually killed (`SIGKILL` via the run's
 context being canceled), not just marked canceled while left running in
 the background — confirmed with no orphaned process left behind after a
 mid-run cancel.
+
+### The inbox: finding out something finished, without a claim/TTL protocol
+
+Earlier designs for "notify the operator when a job finishes" reached for a
+shared events table with atomic claims and TTL-based delivery retries — the
+right answer when *multiple independent processes* are racing to be the one
+that delivers a result. The desk isn't that: it's one always-on daemon, so
+there's no race to arbitrate. Multiple callers seeing the same unacked job
+is harmless. The inbox is a plain query instead:
+
+```bash
+curl localhost:8080/jobs                       # every terminal job not yet acked
+curl 'localhost:8080/jobs/wait-any?timeout=30s' # long-poll: blocks until one exists
+curl -X POST localhost:8080/jobs/job-abc123/ack # done looking at it — clears the inbox
+```
+
+Nothing is lost if nobody polls for a while — unacked rows just sit there,
+same durability guarantee the job store already gives every job. Acking an
+already-acked job is a no-op; acking one that hasn't finished yet is a
+`409`.
+
+### Batches: one job per item, no leases
+
+For a large list of items, `POST /batches` fans out one job per item under
+a shared batch id — each going through the exact same queue, store, and
+retry path as any other job:
+
+```bash
+curl -X POST localhost:8080/batches -d '{
+  "tool": "example-tool",
+  "items": [{"message": "one"}, {"message": "two"}, {"message": "three"}]
+}'
+# 202 {"batch_id":"batch-…","job_ids":["job-…","job-…","job-…"]}
+
+curl localhost:8080/batches/batch-abc123
+# {"batch_id":"…","total":3,"done":2,"failed":0,"running":1,"queued":0,"jobs":[...]}
+```
+
+An invalid item anywhere fails the whole batch at the gate before any job
+is created — no partial fan-out with some items silently skipped. There's
+no per-item lease to expire: there's one worker (the desk itself), and a
+crashed/restarted desk resumes every unfinished item exactly the way it
+resumes any other in-flight job (confirmed: killed a desk mid-batch with
+one item running and two still queued, restarted against the same data
+dir, all three resumed and completed). `GET /batches/{id}`'s items
+done/total is also the batch's own progress signal, no separate heartbeat
+mechanism needed.
 
 A non-conforming request is rejected at the gate:
 
@@ -300,9 +379,9 @@ instead of failing every job — logged clearly either way, same as the
 ## Idempotency and durable jobs (`JobStore`, pluggable)
 
 Job persistence sits behind a `JobStore` interface (`cmd/agent-desk/store.go`):
-`Insert`, `Update`, `Get`, `LoadIncomplete`, `Close`. Two implementations
-ship in this repo; `-store` picks one, and nothing else in the desk knows or
-cares which:
+`Insert`, `Update`, `Get`, `LoadIncomplete`, `ListTerminalUnacked`,
+`ListByBatch`, `Close`. Two implementations ship in this repo; `-store`
+picks one, and nothing else in the desk knows or cares which:
 
 | `-store` | Backend | When to use it |
 |---|---|---|
@@ -351,7 +430,6 @@ through the interface.
 - [x] Durable job log + idempotency behind a pluggable `JobStore`: SQLite by
       default, Postgres opt-in, `idempotency_key` dedup, resume of
       `queued`/`running` jobs after a crash/restart
-- [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [x] Auth token for the desk (optional, `.env`-driven, see Settings above)
 - [x] Per-job memory/task-count cgroup limits (`systemd-run --user --scope`,
       fails open with a clear warning if the environment can't support it)
@@ -359,6 +437,16 @@ through the interface.
       store, and retries; `?wait=`/`GET /jobs/{id}/wait` long-poll instead
       of a tight polling loop; `DELETE /jobs/{id}` cancels a queued or
       running job (process actually killed, not just marked)
+- [x] Inbox model (`GET /jobs`, `GET /jobs/wait-any`, `POST /jobs/{id}/ack`):
+      finding out something finished without a claim/TTL delivery protocol —
+      one daemon means no race to arbitrate, so it's a plain query
+- [x] Batches (`POST /batches`, `GET /batches/{id}`): one job per item, no
+      per-item leases — a crashed/restarted desk resumes every unfinished
+      item the same way it resumes any other job (verified: killed mid-batch,
+      restarted, all items completed)
+- [x] Bypass-resistance via OS permissions, not a harness-specific hook: the
+      desk warns at load time if a run script is executable by group/other
+- [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 
 ## License

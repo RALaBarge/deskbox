@@ -141,8 +141,32 @@ func resolveRunScript(dir string) (string, error) {
 		p := filepath.Join(dir, cand)
 		fi, err := os.Stat(p)
 		if err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			warnIfBypassable(p, fi)
 			return p, nil
 		}
 	}
 	return "", fmt.Errorf("no executable run script (run.sh/run.py/run) found")
+}
+
+// warnIfBypassable flags a tool's run script if anyone other than its
+// owner can execute it directly — group or other execute bits set. That's
+// the actual "can't skip the desk and run the tool by hand" guarantee: not
+// a particular harness's CLI extension intercepting a particular launch
+// pattern (useless the moment a different harness, or a plain shell, is
+// driving), but a permission the OS enforces for every process on the box,
+// desk included. Warn rather than refuse to load: a single-user dev
+// machine, where the operator's shell and the desk run as the same OS
+// account, is this project's primary use case, and file permissions can't
+// distinguish "the desk" from "the operator's shell" when they're the same
+// user by design — enforcing it is a deployment choice (a dedicated
+// service account owning tools/), not something the desk can force here.
+func warnIfBypassable(path string, fi os.FileInfo) {
+	if fi.Mode().Perm()&0o011 != 0 { // group-execute or other-execute
+		log.Printf("WARN: %s is executable by group/other (mode %04o) — "+
+			"anyone on this box other than the script's owner can run it "+
+			"directly, bypassing every contract check. If that matters for "+
+			"your deployment, chmod 700 it (or chown tools/ to a dedicated "+
+			"service account that only the desk runs as).",
+			path, fi.Mode().Perm())
+	}
 }

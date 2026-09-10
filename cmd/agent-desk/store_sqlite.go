@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -40,6 +41,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_tool_idempotency_key_uniq
 	ON jobs (tool, idempotency_key) WHERE idempotency_key IS NOT NULL;
 `
 
+// sqliteColumnAdditions are new columns layered onto the original schema.
+// SQLite has no "ADD COLUMN IF NOT EXISTS", so each is applied via ALTER
+// TABLE with the "duplicate column name" error swallowed — an idempotent,
+// no-migration-tool migration, same philosophy as the CREATE TABLE IF NOT
+// EXISTS above: a fresh DB and an upgraded existing one both end up correct.
+var sqliteColumnAdditions = []string{
+	"ALTER TABLE jobs ADD COLUMN batch_id TEXT",
+	"ALTER TABLE jobs ADD COLUMN acked INTEGER NOT NULL DEFAULT 0",
+	"ALTER TABLE jobs ADD COLUMN acked_at TEXT",
+}
+
+const sqlitePostSchema = `
+CREATE INDEX IF NOT EXISTS jobs_batch_id_idx ON jobs (batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_terminal_unacked_idx ON jobs (acked, status);
+`
+
 // timeLayout is used for every timestamp column: SQLite has no native
 // datetime type, so times round-trip as RFC3339Nano TEXT instead.
 const timeLayout = time.RFC3339Nano
@@ -65,6 +82,16 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, sqliteSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	for _, ddl := range sqliteColumnAdditions {
+		if _, err := db.ExecContext(ctx, ddl); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %s: %w", ddl, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, sqlitePostSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -99,13 +126,14 @@ func (s *SQLiteStore) Insert(job *Job, idempotencyKey string) (existing *Job, cr
 	// across SQLite builds regardless of RETURNING support, and simpler —
 	// RowsAffected alone says whether this call won the row.
 	const ins = `
-INSERT INTO jobs (id, tool, idempotency_key, input, meta, status, attempt, max_retries, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO jobs (id, tool, idempotency_key, input, meta, status, attempt, max_retries, created_at, batch_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (tool, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 `
 	res, err := s.db.ExecContext(ctx, ins,
 		job.ID, job.Tool, key, string(inputJSON), string(metaJSON),
-		job.Status, job.Attempt, job.MaxRetries, job.Created.UTC().Format(timeLayout))
+		job.Status, job.Attempt, job.MaxRetries, job.Created.UTC().Format(timeLayout),
+		nullableString(job.BatchID))
 	if err != nil {
 		return nil, false, err
 	}
@@ -118,12 +146,7 @@ ON CONFLICT (tool, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 	// Conflict: another job already owns this (tool, idempotency_key). An
 	// empty idempotencyKey never matches the partial unique index, so
 	// DO NOTHING never fires for it — this path only runs with a real key.
-	const sel = `
-SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-       result, error, created_at, started_at, finished_at
-FROM jobs WHERE tool = ? AND idempotency_key = ?
-`
-	row := s.db.QueryRowContext(ctx, sel, job.Tool, idempotencyKey)
+	row := s.db.QueryRowContext(ctx, sqliteSelectCols+"FROM jobs WHERE tool = ? AND idempotency_key = ?", job.Tool, idempotencyKey)
 	got, err := scanSQLiteJob(row)
 	if err != nil {
 		return nil, false, err
@@ -138,26 +161,29 @@ func (s *SQLiteStore) Update(job *Job) error {
 		return fmt.Errorf("marshal result: %w", err)
 	}
 	const q = `
-UPDATE jobs SET status=?, attempt=?, result=?, error=?, started_at=?, finished_at=?
+UPDATE jobs SET status=?, attempt=?, result=?, error=?, started_at=?, finished_at=?, acked=?, acked_at=?
 WHERE id=?
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx, q,
 		job.Status, job.Attempt, nullableJSONText(resultJSON), nullableString(job.Error),
-		nullableTime(job.Started), nullableTime(job.Finished), job.ID)
+		nullableTime(job.Started), nullableTime(job.Finished), job.Acked, nullableTime(job.AckedAt),
+		job.ID)
 	return err
 }
 
-func (s *SQLiteStore) Get(id string) (*Job, bool, error) {
-	const q = `
+// sqliteSelectCols is the fixed column list + order every SELECT below
+// uses, so a single scanSQLiteJob can serve all of them without drift.
+const sqliteSelectCols = `
 SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-       result, error, created_at, started_at, finished_at
-FROM jobs WHERE id = ?
+       result, error, created_at, started_at, finished_at, batch_id, acked, acked_at
 `
+
+func (s *SQLiteStore) Get(id string) (*Job, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	row := s.db.QueryRowContext(ctx, q, id)
+	row := s.db.QueryRowContext(ctx, sqliteSelectCols+"FROM jobs WHERE id = ?", id)
 	job, err := scanSQLiteJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -172,14 +198,59 @@ FROM jobs WHERE id = ?
 // process lifetime — the set that must be resumed on startup so a desk
 // restart doesn't silently drop or duplicate work already accepted.
 func (s *SQLiteStore) LoadIncomplete() ([]*Job, error) {
-	const q = `
-SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-       result, error, created_at, started_at, finished_at
-FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at
-`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := s.db.QueryContext(ctx, sqliteSelectCols+"FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []*Job
+	for rows.Next() {
+		job, err := scanSQLiteJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ListTerminalUnacked returns terminal jobs the operator hasn't acked yet,
+// most-recently-finished first — the inbox behind GET /jobs and
+// GET /jobs/wait-any.
+func (s *SQLiteStore) ListTerminalUnacked(limit int) ([]*Job, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const q = sqliteSelectCols + `
+FROM jobs WHERE acked = 0 AND status IN ('done', 'failed', 'canceled')
+ORDER BY finished_at DESC LIMIT ?
+`
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []*Job
+	for rows.Next() {
+		job, err := scanSQLiteJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ListByBatch returns every job submitted under the given batch id, in
+// submission order.
+func (s *SQLiteStore) ListByBatch(batchID string) ([]*Job, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, sqliteSelectCols+"FROM jobs WHERE batch_id = ? ORDER BY created_at", batchID)
 	if err != nil {
 		return nil, err
 	}
@@ -198,21 +269,25 @@ FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at
 func scanSQLiteJob(row rowScanner) (*Job, error) {
 	var (
 		job                       Job
-		idemKey                   sql.NullString
+		idemKey, batchID          sql.NullString
 		inputText, metaText       sql.NullString
 		resultText, errText       sql.NullString
 		createdText               string
 		startedText, finishedText sql.NullString
+		acked                     bool
+		ackedAtText               sql.NullString
 	)
 	if err := row.Scan(
 		&job.ID, &job.Tool, &idemKey, &inputText, &metaText, &job.Status,
 		&job.Attempt, &job.MaxRetries, &resultText, &errText,
-		&createdText, &startedText, &finishedText,
+		&createdText, &startedText, &finishedText, &batchID, &acked, &ackedAtText,
 	); err != nil {
 		return nil, err
 	}
 	job.IdempotencyKey = idemKey.String
 	job.Error = errText.String
+	job.BatchID = batchID.String
+	job.Acked = acked
 
 	created, err := time.Parse(timeLayout, createdText)
 	if err != nil {
@@ -232,6 +307,13 @@ func scanSQLiteJob(row rowScanner) (*Job, error) {
 			return nil, fmt.Errorf("parse finished_at: %w", err)
 		}
 		job.Finished = &t
+	}
+	if ackedAtText.Valid {
+		t, err := time.Parse(timeLayout, ackedAtText.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse acked_at: %w", err)
+		}
+		job.AckedAt = &t
 	}
 	if inputText.Valid && inputText.String != "" {
 		if err := json.Unmarshal([]byte(inputText.String), &job.Input); err != nil {

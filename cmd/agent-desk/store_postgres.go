@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_tool_idempotency_key_uniq
 	ON jobs (tool, idempotency_key) WHERE idempotency_key IS NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS acked BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS acked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS jobs_batch_id_idx ON jobs (batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_terminal_unacked_idx ON jobs (acked, status);
 `
 
 func NewPostgresStore(dsn string) (*PostgresStore, error) {
@@ -58,6 +63,12 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 
 func (s *PostgresStore) Close() error { return s.db.Close() }
 
+// postgresSelectCols is the fixed column list + order every SELECT/RETURNING
+// below uses, so a single scanPostgresJob can serve all of them without
+// drift. Insert appends "(xmax = 0) AS inserted" after these when needed.
+const postgresSelectCols = `id, tool, idempotency_key, input, meta, status, attempt, max_retries,
+          result, error, created_at, started_at, finished_at, batch_id, acked, acked_at`
+
 // Insert writes a new job row. If idempotencyKey is non-empty and a job
 // already exists for (tool, idempotencyKey), the existing row is returned
 // with created=false and the caller must not enqueue job for execution —
@@ -77,19 +88,17 @@ func (s *PostgresStore) Insert(job *Job, idempotencyKey string) (existing *Job, 
 		key = idempotencyKey
 	}
 
-	const q = `
-INSERT INTO jobs (id, tool, idempotency_key, input, meta, status, attempt, max_retries, created_at)
-VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9)
+	q := `
+INSERT INTO jobs (id, tool, idempotency_key, input, meta, status, attempt, max_retries, created_at, batch_id)
+VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, $9, $10)
 ON CONFLICT (tool, idempotency_key) WHERE idempotency_key IS NOT NULL
 DO UPDATE SET tool = jobs.tool
-RETURNING id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-          result, error, created_at, started_at, finished_at, (xmax = 0) AS inserted
-`
+RETURNING ` + postgresSelectCols + `, (xmax = 0) AS inserted`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, q,
 		job.ID, job.Tool, key, inputJSON, metaJSON,
-		job.Status, job.Attempt, job.MaxRetries, job.Created)
+		job.Status, job.Attempt, job.MaxRetries, job.Created, nullableString(job.BatchID))
 
 	var inserted bool
 	got, err := scanPostgresJob(row, &inserted)
@@ -106,23 +115,19 @@ func (s *PostgresStore) Update(job *Job) error {
 		return fmt.Errorf("marshal result: %w", err)
 	}
 	const q = `
-UPDATE jobs SET status=$2, attempt=$3, result=$4::jsonb, error=$5, started_at=$6, finished_at=$7
+UPDATE jobs SET status=$2, attempt=$3, result=$4::jsonb, error=$5, started_at=$6, finished_at=$7, acked=$8, acked_at=$9
 WHERE id=$1
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx, q,
 		job.ID, job.Status, job.Attempt, resultJSON, nullableString(job.Error),
-		job.Started, job.Finished)
+		job.Started, job.Finished, job.Acked, job.AckedAt)
 	return err
 }
 
 func (s *PostgresStore) Get(id string) (*Job, bool, error) {
-	const q = `
-SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-       result, error, created_at, started_at, finished_at
-FROM jobs WHERE id = $1
-`
+	q := `SELECT ` + postgresSelectCols + ` FROM jobs WHERE id = $1`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := s.db.QueryRowContext(ctx, q, id)
@@ -140,11 +145,7 @@ FROM jobs WHERE id = $1
 // process lifetime — the set that must be resumed on startup so a desk
 // restart doesn't silently drop or duplicate work already accepted.
 func (s *PostgresStore) LoadIncomplete() ([]*Job, error) {
-	const q = `
-SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
-       result, error, created_at, started_at, finished_at
-FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at
-`
+	q := `SELECT ` + postgresSelectCols + ` FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rows, err := s.db.QueryContext(ctx, q)
@@ -163,19 +164,71 @@ FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at
 	return jobs, rows.Err()
 }
 
+// ListTerminalUnacked returns terminal jobs the operator hasn't acked yet,
+// most-recently-finished first — the inbox behind GET /jobs and
+// GET /jobs/wait-any.
+func (s *PostgresStore) ListTerminalUnacked(limit int) ([]*Job, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	q := `SELECT ` + postgresSelectCols + ` FROM jobs
+WHERE acked = false AND status IN ('done', 'failed', 'canceled')
+ORDER BY finished_at DESC LIMIT $1`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []*Job
+	for rows.Next() {
+		job, err := scanPostgresJob(rows, nil)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// ListByBatch returns every job submitted under the given batch id, in
+// submission order.
+func (s *PostgresStore) ListByBatch(batchID string) ([]*Job, error) {
+	q := `SELECT ` + postgresSelectCols + ` FROM jobs WHERE batch_id = $1 ORDER BY created_at`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := s.db.QueryContext(ctx, q, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []*Job
+	for rows.Next() {
+		job, err := scanPostgresJob(rows, nil)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 func scanPostgresJob(row rowScanner, inserted *bool) (*Job, error) {
 	var (
 		job                 Job
-		idemKey             sql.NullString
+		idemKey, batchID    sql.NullString
 		inputJSON, metaJSON []byte
 		resultJSON          []byte
 		errText             sql.NullString
 		started, finished   sql.NullTime
+		acked               bool
+		ackedAt             sql.NullTime
 	)
 	dest := []any{
 		&job.ID, &job.Tool, &idemKey, &inputJSON, &metaJSON, &job.Status,
 		&job.Attempt, &job.MaxRetries, &resultJSON, &errText,
-		&job.Created, &started, &finished,
+		&job.Created, &started, &finished, &batchID, &acked, &ackedAt,
 	}
 	if inserted != nil {
 		dest = append(dest, inserted)
@@ -185,11 +238,16 @@ func scanPostgresJob(row rowScanner, inserted *bool) (*Job, error) {
 	}
 	job.IdempotencyKey = idemKey.String
 	job.Error = errText.String
+	job.BatchID = batchID.String
+	job.Acked = acked
 	if started.Valid {
 		job.Started = &started.Time
 	}
 	if finished.Valid {
 		job.Finished = &finished.Time
+	}
+	if ackedAt.Valid {
+		job.AckedAt = &ackedAt.Time
 	}
 	if len(inputJSON) > 0 {
 		if err := json.Unmarshal(inputJSON, &job.Input); err != nil {

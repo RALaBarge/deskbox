@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -172,10 +174,15 @@ func main() {
 	mux.HandleFunc("GET /tools", d.handleListTools)
 	mux.HandleFunc("GET /tools/{name}", d.handleGetTool)
 	mux.HandleFunc("POST /tools/{name}", d.handleSubmit)
+	mux.HandleFunc("GET /jobs", d.handleListInbox)
+	mux.HandleFunc("GET /jobs/wait-any", d.handleWaitAnyJob)
 	mux.HandleFunc("GET /jobs/{id}", d.handleGetJob)
 	mux.HandleFunc("GET /jobs/{id}/wait", d.handleWaitJob)
+	mux.HandleFunc("POST /jobs/{id}/ack", d.handleAckJob)
 	mux.HandleFunc("DELETE /jobs/{id}", d.handleCancelJob)
 	mux.HandleFunc("GET /jobs/{id}/out/{file...}", d.handleGetOutFile)
+	mux.HandleFunc("POST /batches", d.handleCreateBatch)
+	mux.HandleFunc("GET /batches/{id}", d.handleGetBatch)
 	mux.HandleFunc("GET /queue", d.handleQueueStats)
 
 	var handler http.Handler = mux
@@ -419,6 +426,185 @@ func (d *Desk) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleListInbox is the inbox: every terminal job the operator hasn't
+// acked yet, most-recently-finished first. This is the desk's replacement
+// for a claim/TTL delivery mechanism — with one always-on desk process
+// instead of many independent ones, there's no "who's currently watching"
+// race to arbitrate: multiple readers seeing the same unacked job is
+// harmless, so this is a plain query, not a claim. Nothing is lost if
+// nobody polls it for a while — unacked rows just sit there.
+func (d *Desk) handleListInbox(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "limit must be a positive integer"})
+			return
+		}
+		limit = n
+	}
+	jobs, err := d.queue.ListTerminalUnacked(limit)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// handleWaitAnyJob long-polls the inbox: blocks until at least one job is
+// terminal-and-unacked, or ?timeout elapses (default 25s, capped at
+// maxWait) — instead of polling GET /jobs yourself in a loop. The
+// zero-latency half of the inbox model.
+func (d *Desk) handleWaitAnyJob(w http.ResponseWriter, r *http.Request) {
+	timeout := 25 * time.Second
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid timeout duration %q: %v", raw, err)})
+			return
+		}
+		if parsed < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "timeout must not be negative"})
+			return
+		}
+		if parsed > maxWait {
+			parsed = maxWait
+		}
+		timeout = parsed
+	}
+	jobs, err := d.queue.WaitForAnyTerminal(r.Context(), time.Now().Add(timeout))
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	if jobs == nil {
+		jobs = []*Job{} // timed out with nothing unacked: {"jobs":[]}, not null
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// handleAckJob marks a terminal job's result seen/handled — the other half
+// of the inbox model (handleListInbox is the inbox; this empties it one
+// item at a time). Acking a non-terminal job is a 409: there's nothing to
+// ack yet. Acking an already-acked job is idempotent, not an error.
+func (d *Desk) handleAckJob(w http.ResponseWriter, r *http.Request) {
+	job, err := d.queue.Ack(r.PathValue("id"))
+	switch {
+	case errors.Is(err, errJobNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "job not found"})
+	case errors.Is(err, errJobNotTerminal):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": errJobNotTerminal.Error()})
+	case err != nil:
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+	default:
+		writeJSON(w, http.StatusOK, job)
+	}
+}
+
+type batchRequest struct {
+	Tool  string           `json:"tool"`
+	Items []map[string]any `json:"items"`
+	Meta  map[string]any   `json:"meta,omitempty"`
+}
+
+// handleCreateBatch is the first-class replacement for lease-based chunk
+// claiming: one job per item, fanned out under a shared batch id, each
+// going through the exact same queue/store/retry path as any other job.
+// A dead item is just a failed job on the existing retry path; a desk
+// restart mid-batch resumes via Resume/LoadIncomplete same as any other
+// in-flight job — there is one worker (the desk itself), so there's
+// nothing to lease from itself if it goes away and comes back.
+func (d *Desk) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
+	var req batchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	tool, ok := d.tools[req.Tool]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "tool not found: " + req.Tool})
+		return
+	}
+	if len(req.Items) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "items must be a non-empty array"})
+		return
+	}
+
+	items := make([]map[string]any, len(req.Items))
+	for i, item := range req.Items {
+		if item == nil {
+			item = map[string]any{}
+		}
+		items[i] = item
+	}
+
+	// The gate, same as a single submit — but for every item, before any
+	// job is created: an invalid item anywhere fails the whole batch, not
+	// a partial fan-out with some items silently skipped.
+	if tool.Input != nil {
+		violations := map[string]any{}
+		for i, item := range items {
+			if viol := Validate(*tool.Input, item); len(viol) > 0 {
+				violations[strconv.Itoa(i)] = viol
+			}
+		}
+		if len(violations) > 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":      "contract violation: one or more items do not conform to the tool contract",
+				"violations": violations,
+			})
+			return
+		}
+	}
+
+	batchID, jobs, err := d.queue.SubmitBatch(tool, items, req.Meta)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jobIDs := make([]string, len(jobs))
+	for i, j := range jobs {
+		jobIDs[i] = j.ID
+	}
+	w.Header().Set("Location", "/batches/"+batchID)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"batch_id": batchID,
+		"tool":     tool.Name,
+		"job_ids":  jobIDs,
+	})
+}
+
+// handleGetBatch reports batch progress: items done/total, broken down by
+// status. This is the "content-progress heartbeat" flagged as unbuilt in
+// the old system's own design notes — here for free, as a side effect of
+// a batch item just being an ordinary job the desk already tracks.
+func (d *Desk) handleGetBatch(w http.ResponseWriter, r *http.Request) {
+	batchID := r.PathValue("id")
+	jobs, err := d.queue.ListByBatch(batchID)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "job store temporarily unavailable"})
+		return
+	}
+	if len(jobs) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "batch not found"})
+		return
+	}
+	counts := map[JobStatus]int{}
+	for _, j := range jobs {
+		counts[j.Status]++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"batch_id": batchID,
+		"total":    len(jobs),
+		"queued":   counts[StatusQueued],
+		"running":  counts[StatusRunning],
+		"done":     counts[StatusDone],
+		"failed":   counts[StatusFailed],
+		"canceled": counts[StatusCanceled],
+		"jobs":     jobs,
+	})
 }
 
 func (d *Desk) handleGetJob(w http.ResponseWriter, r *http.Request) {
