@@ -6,6 +6,9 @@
 exec:
   - jq
   - -c
+  # Everything after -- is data, so a filter that legitimately starts with
+  # "-" (jq's negative numbers) reaches jq as a filter, not as a flag.
+  - --
   - "{{.filter}}"
 
 # jq wants the document on stdin. `json` is required here: interpolating

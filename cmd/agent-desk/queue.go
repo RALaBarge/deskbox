@@ -90,6 +90,11 @@ type Queue struct {
 	// left to drain it. Routing every enqueue through here means neither a
 	// worker nor an HTTP handler ever blocks on a full channel.
 	pending []*Job
+	// reserved counts admission slots claimed by reserve() but not yet
+	// filled by enqueueReserved — the job is being written to the store
+	// right now. Counted against maxPending so a burst of concurrent
+	// submits can't collectively overshoot the cap.
+	reserved int
 	// wake signals dispatch() that pending grew. Buffered(1) and sent
 	// non-blockingly: one pending signal is enough, since dispatch
 	// re-checks the whole backlog under the lock on every loop.
@@ -117,36 +122,73 @@ func NewQueue(workers int, store JobStore) *Queue {
 	}
 }
 
-// enqueue admits a new job to the backlog. Never blocks: it either appends
-// (and signals the dispatcher) or refuses outright when the backlog is at
-// maxPending.
-func (q *Queue) enqueue(job *Job) error { return q.push(job, true) }
-
-// requeue puts already-accepted work back on the backlog — a retry, or a
-// job reloaded after a restart. Never blocks and never refuses: the desk
-// already told someone this job exists.
-func (q *Queue) requeue(job *Job) error { return q.push(job, false) }
-
-func (q *Queue) push(job *Job, admit bool) error {
+// reserve claims a backlog slot for a new submission *before* the job is
+// written to the store. Admission has to be decided first: refusing after
+// the row exists leaves a job nobody is running but everybody can see —
+// Resume() picks it up on the next restart despite the caller being told
+// it was refused, and a retry with the same idempotency_key dedupes
+// against that orphan and gets back a job that will never run.
+//
+// Once reserved, the enqueue itself cannot fail on capacity, so there is
+// no window where the row is committed and the slot isn't.
+func (q *Queue) reserve() error {
 	select {
 	case <-q.stop:
 		return errQueueStopped
 	default:
 	}
-
 	q.mu.Lock()
-	if admit && len(q.pending) >= maxPending {
-		q.mu.Unlock()
+	defer q.mu.Unlock()
+	if len(q.pending)+q.reserved >= maxPending {
 		return errQueueFull
+	}
+	q.reserved++
+	return nil
+}
+
+// release gives back a reservation whose job never made it — the store
+// write failed, or an idempotency key deduped it onto an existing job.
+func (q *Queue) release() {
+	q.mu.Lock()
+	if q.reserved > 0 {
+		q.reserved--
+	}
+	q.mu.Unlock()
+}
+
+// enqueueReserved consumes a reservation taken by reserve(). It cannot
+// fail: capacity was already accounted for.
+func (q *Queue) enqueueReserved(job *Job) {
+	q.mu.Lock()
+	if q.reserved > 0 {
+		q.reserved--
 	}
 	q.pending = append(q.pending, job)
 	q.mu.Unlock()
+	q.signalWake()
+}
 
+// requeue puts already-accepted work back on the backlog — a retry, or a
+// job reloaded after a restart. Never blocks and never refuses on
+// capacity: the desk already told someone this job exists.
+func (q *Queue) requeue(job *Job) error {
+	select {
+	case <-q.stop:
+		return errQueueStopped
+	default:
+	}
+	q.mu.Lock()
+	q.pending = append(q.pending, job)
+	q.mu.Unlock()
+	q.signalWake()
+	return nil
+}
+
+func (q *Queue) signalWake() {
 	select {
 	case q.wake <- struct{}{}:
 	default: // a wake is already pending; dispatch will see this job anyway
 	}
-	return nil
 }
 
 // dispatch is the only sender on ch. It moves jobs from the pending backlog
@@ -256,12 +298,19 @@ func (q *Queue) submit(tool *Tool, input, meta map[string]any, idempotencyKey, b
 		Created: time.Now().UTC(),
 	}
 
+	// Decide admission before anything is persisted — see reserve().
+	if err := q.reserve(); err != nil {
+		return nil, err
+	}
+
 	if q.store != nil {
 		existing, created, err := q.store.Insert(job, idempotencyKey)
 		if err != nil {
+			q.release()
 			return nil, fmt.Errorf("persist job: %w", err)
 		}
 		if !created {
+			q.release() // deduped onto an existing job; nothing new to run
 			// Same (tool, idempotency_key) already has a job. If it's still
 			// tracked in-process (queued/running), that pointer — not the
 			// point-in-time DB snapshot — is the live truth: overwriting the
@@ -284,9 +333,7 @@ func (q *Queue) submit(tool *Tool, input, meta map[string]any, idempotencyKey, b
 	q.mu.Lock()
 	q.jobs[job.ID] = job
 	q.mu.Unlock()
-	if err := q.enqueue(job); err != nil {
-		return nil, err
-	}
+	q.enqueueReserved(job)
 	return q.snapshot(job), nil
 }
 
@@ -368,8 +415,13 @@ func (q *Queue) process(job *Job) {
 	job.Attempt++
 	job.Started = &now
 	q.cancels[job.ID] = cancel
+	// Copy under the lock and persist the copy. Handing the live pointer to
+	// store.Update lets it read Status/Finished with no lock while Cancel()
+	// writes them under one — a real race, not a theoretical one, and the
+	// reason finish/finishCanceled already do this.
+	cp := *job
 	q.mu.Unlock()
-	q.persist(job)
+	q.persist(&cp)
 
 	result, err := q.desk.Execute(ctx, tool, job, job.Input)
 
@@ -397,8 +449,9 @@ func (q *Queue) process(job *Job) {
 		q.mu.Lock()
 		job.Status = StatusQueued
 		job.Error = err.Error()
+		retryCp := *job
 		q.mu.Unlock()
-		q.persist(job)
+		q.persist(&retryCp)
 		select {
 		case <-time.After(backoff):
 		case <-q.stop:

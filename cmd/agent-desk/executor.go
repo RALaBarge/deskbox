@@ -22,6 +22,40 @@ import (
 // permanent — the desk does not retry them.
 var ErrContract = errors.New("contract violation")
 
+const (
+	// maxToolOutput bounds what a single job can hand back — stdout, or a
+	// declared out file. The result becomes a JSON document the desk holds
+	// in memory, stores, and serves, so "however much the tool felt like
+	// printing" is not a size the desk can accept.
+	maxToolOutput = 32 << 20 // 32 MiB
+	// maxToolStderr bounds the diagnostic text that becomes job.Error.
+	maxToolStderr = 64 << 10
+)
+
+// cappedBuffer accumulates up to max bytes, then drops the rest while still
+// reporting success to the writer — a tool that overruns gets a clean
+// contract violation rather than an EPIPE mid-write, and the desk's heap
+// stays bounded regardless of what the tool does.
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	max      int64
+	overflow bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if !b.overflow {
+		if remaining := b.max - int64(b.buf.Len()); int64(len(p)) > remaining {
+			b.buf.Write(p[:remaining])
+			b.overflow = true
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string { return b.buf.String() }
+
 // bakeSandbox builds the bwrap argv for a tool run.
 //
 // The sandbox layer is minimal by construction. Inside it, the tool sees:
@@ -173,9 +207,14 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 	// a second, duplicate run of the same job. Pdeathsig closes that no
 	// matter how violently the desk dies, without needing graceful shutdown.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	// Capped, not a plain Buffer: the desk runs outside the per-job cgroup
+	// scope, so a tool firehosing stdout would grow the *desk's* heap, not
+	// its own capped one — and on hosts where systemd-run isn't usable
+	// (the desk fails open there by design) there is no cap at all.
+	outBuf := &cappedBuffer{max: maxToolOutput}
+	errBuf := &cappedBuffer{max: maxToolStderr}
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
 	// Fully-controlled env: nothing from the host shell leaks into the sandbox.
 	cmd.Env = []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -269,6 +308,13 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 			if !fi.Mode().IsRegular() {
 				return nil, fmt.Errorf("%w: declared output %q is not a regular file", ErrContract, f)
 			}
+			// Size-checked before reading: a declared out file is written
+			// inside the sandbox and can be arbitrarily large, and
+			// os.ReadFile would pull all of it into the desk's heap.
+			if fi.Size() > maxToolOutput {
+				return nil, fmt.Errorf("%w: declared output %q is %d bytes, over the %d-byte limit",
+					ErrContract, f, fi.Size(), maxToolOutput)
+			}
 			b, err := os.ReadFile(p)
 			if err == nil {
 				raw = b
@@ -283,6 +329,10 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 			return nil, fmt.Errorf("%w: output file is not valid JSON: %v", ErrContract, err)
 		}
 	} else {
+		if outBuf.overflow {
+			return nil, fmt.Errorf("%w: tool wrote more than %d bytes to stdout",
+				ErrContract, maxToolOutput)
+		}
 		out := strings.TrimSpace(outBuf.String())
 		if out == "" {
 			return nil, fmt.Errorf("%w: tool produced no output on stdout (contract requires a JSON document)", ErrContract)

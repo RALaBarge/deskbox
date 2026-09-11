@@ -48,22 +48,67 @@ exec:
 stdin: "{{.text}}"          # optional; use {{json .field}} to pass an object
 
 success_exit_codes: [0, 1]  # grep's 1 means "no matches", not "failed"
+max_output_bytes: 33554432  # optional; 32 MiB default
+allow_flag_values: false    # optional; see the injection notes below
 
 output:
-  mode: lines               # json | raw | lines | jsonl
-  field: matches            # required except for json mode
+  mode: lines               # json | raw | lines | jsonl | base64
+  field: matches            # optional, defaults to "data"
   include_exit_code: false
 ```
 
 **Output modes.** `json` passes the command's own JSON straight through
 (the desk then validates it against `tcs.yaml`). `raw` wraps stdout as a
-string, `lines` splits it into an array, `jsonl` parses each line.
+string, `lines` splits it into an array, `jsonl` parses each line, and
+`base64` encodes the bytes for a tool that emits binary.
 
-**On injection.** `exec` is an argv array executed directly — there is no
-shell anywhere in the path, so a value containing `$(...)`, backticks or
-`;` is passed to the command as literal text and cannot start a second
-process. Verified, not assumed: feeding `$(touch /tmp/PWNED)` as a jq
-filter produces a jq syntax error and no file.
+`raw` and `lines` reject output that isn't valid UTF-8 rather than
+accepting it: Go's JSON encoder silently rewrites every invalid byte as
+U+FFFD, so a binary blob would round-trip as corrupted text that still
+satisfies a `type: string` schema. Use `base64` for those tools.
+
+**Output is capped** at `max_output_bytes` (32 MiB default) and the job
+fails cleanly past it. This is not belt-and-braces: buffering is a memory
+amplifier — the buffer, the string copy and the JSON encoding of the same
+bytes coexist, so 600 MB of tool output measured **3.19 GB of RSS** before
+the cap existed. The per-job cgroup is not a dependable backstop either,
+since `systemd-run --user --scope` is unavailable on plenty of hosts and
+the desk fails open when it is. The desk applies the same cap on its own
+side.
+
+**On injection — what is and isn't guaranteed.** `exec` is an argv array
+executed directly, with no shell anywhere in the path, so a value
+containing `$(...)`, backticks or `;` reaches the command as literal text.
+Verified: `$(touch /tmp/PWNED)` as a jq filter produces a jq syntax error
+and no file.
+
+That is *not* the same as "a caller-supplied value can never cause
+execution", and an earlier version of this document wrongly claimed it was.
+No shell is needed to run a command if the wrapped tool has a flag that
+runs one: `find -exec`, `xargs`, `tar --to-command`, `ssh`, `rsync -e`. A
+review broke the original design exactly this way — a `find` shim
+spreading caller input accepted `-exec /usr/bin/touch /tmp/PWNED ;` and
+created the file, with no shell involved.
+
+So the shim also refuses any caller-supplied value that starts with `-`:
+
+```
+tcs-shim: exec[2] (spread "filters"): refusing caller-supplied value "-name"
+because it starts with "-" and would reach the command as a flag.
+```
+
+Two things deliberately *don't* trip it. A literal in `shim.yaml` is your
+own text, so `-n` and `-c` are fine. And a conditional like
+`{{if .ignore_case}}-i{{end}}` is also your text — the caller decides
+whether it appears, never what it says — so optional flags keep working.
+Only values that actually carry caller data are checked, decided by
+inspecting the parsed template rather than guessing from the presence of
+`{{`.
+
+Once you emit a literal `--`, everything after it is positional and the
+guard steps aside, which is what makes the error message's advice actually work.
+`allow_flag_values: true` disables the check entirely — only for a command
+that genuinely cannot be made to execute anything.
 
 **Enforcement is not weakened.** A shimmed tool is still a tool: same bwrap
 sandbox, same `network: false`, same `out/` audit, same per-job memory and
