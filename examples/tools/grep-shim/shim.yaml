@@ -1,0 +1,21 @@
+exec:
+  - grep
+  # Renders empty when ignore_case is absent or false, and an element that
+  # renders empty is dropped — that is how an optional flag stays optional
+  # without needing two separate exec lines.
+  - "{{if .ignore_case}}-i{{end}}"
+  - -n
+  # Everything after -- is data, so a pattern starting with - can't be
+  # mistaken for a flag.
+  - --
+  - "{{.pattern}}"
+
+stdin: "{{.text}}"
+
+# grep's exit 1 means "no matches", which is a result, not a failure. Without
+# this the desk would fail (and retry) every search that found nothing.
+success_exit_codes: [0, 1]
+
+output:
+  mode: lines
+  field: matches

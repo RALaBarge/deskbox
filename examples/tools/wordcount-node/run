@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// Read one JSON document on stdin, write exactly one on stdout.
+// Nothing here imports or knows about the desk.
+
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  const { text } = JSON.parse(raw);
+  const words = text.split(/\s+/).filter((w) => w.length > 0).length;
+  const lines = text === "" ? 0 : text.split("\n").length;
+  process.stdout.write(JSON.stringify({ words, chars: text.length, lines }));
+});

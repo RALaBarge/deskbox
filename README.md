@@ -22,15 +22,25 @@ deskbox/
 │   │   ├── store.go         # JobStore interface (pluggable durable backend)
 │   │   ├── store_sqlite.go  # default backend: one file, no server
 │   │   └── store_postgres.go # optional: shared job state across desk instances
+│   ├── tcs-shim/            # generic adapter for CLIs that never heard of the desk
 │   └── tcs-verify/          # (stub) Rust CLI for offline spec checking
+├── examples/tools/          # four sample tools; copy into tools/ to use
 └── tools/                   # the space agents read, each tool owns a folder:
     └── <name>/              #   tcs.yaml (contract), run.sh (implementation),
                               #   README.md (skill notes for agents)
 ```
 
-No tools ship in this repo yet. `tools/` is where you drop your own.
+No tools ship in `tools/` — that space is yours alone, and examples that
+auto-loaded into it would undercut the point. Working samples live in
+[`examples/tools/`](examples/tools/) (Python, JavaScript, and two built on
+`tcs-shim` that wrap `jq` and `grep` with no glue code); copy what you want.
 
 A folder is a tool iff it contains `tcs.yaml` + an executable `run.sh|run.py|run`.
+
+Every run gets `DESKBOX_TOOL_DIR` in its environment, pointing at the tool's
+own folder — `/deskbox/tool` inside the sandbox, the real path when
+bubblewrap isn't available. Read vendored data or a shim config through it
+rather than hardcoding either path.
 
 ## Tool Contract Spec (per tool, in `tools/<name>/tcs.yaml`)
 
@@ -296,10 +306,18 @@ Ubuntu-only AppArmor gotcha (system config, not a DeskBox bug).
 # requires Go 1.22+
 go build -o bin/agent-desk ./cmd/agent-desk
 ./bin/agent-desk -addr :8080                   # -workers defaults to 10, -tools to ./tools
+
+# optional: the adapter for wrapping pre-existing CLIs. Install it somewhere
+# the sandbox can see — /usr is bound read-only, a home dir is not.
+go build -o /usr/local/bin/tcs-shim ./cmd/tcs-shim
 ```
 
-No demo tools ship in this repo. Write a `tcs.yaml` + `run.sh` under
-`tools/<name>/` following the conventions above and the desk will pick it up.
+Write a `tcs.yaml` + `run.sh` under `tools/<name>/` following the conventions
+above and the desk will pick it up — or start from one of the samples:
+
+```bash
+cp -r examples/tools/greet-python tools/
+```
 
 ## Settings (.env, optional)
 
@@ -446,6 +464,12 @@ through the interface.
       restarted, all items completed)
 - [x] Bypass-resistance via OS permissions, not a harness-specific hook: the
       desk warns at load time if a run script is executable by group/other
+- [x] `tcs-shim`: adapt a pre-existing CLI (argv flags in, text out) to the
+      contract with a declarative `shim.yaml` and no per-tool glue code —
+      argv-array exec so values can't inject a shell, and the wrapped
+      binary still gets the full sandbox/audit/schema enforcement
+- [x] Example tools in `examples/tools/` proving the language-agnostic
+      claim concretely: Python, JavaScript, and two shimmed CLIs
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 

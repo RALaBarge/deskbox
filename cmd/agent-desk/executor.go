@@ -196,8 +196,15 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		scoped = len(wrapped) > len(args)
 		cmd.Path = wrapped[0]
 		cmd.Args = wrapped
+		// Inside the sandbox the tool's own folder is always bound here.
+		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR=/deskbox/tool")
 	} else {
 		log.Printf("WARN: sandbox unavailable (%v); running unsandboxed (advisory only)", err)
+		// Unsandboxed, /deskbox/tool doesn't exist — a tool that reads its
+		// own folder (vendored data, a shim's config) needs the real path
+		// or it silently breaks in exactly the advisory mode meant to be a
+		// degraded-but-working fallback.
+		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR="+toolDir)
 	}
 
 	start := time.Now()
