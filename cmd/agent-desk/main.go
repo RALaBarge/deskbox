@@ -34,6 +34,9 @@ type Desk struct {
 	queue    *Queue
 	dataDir  string
 	settings *Settings
+	// sandboxOK: bubblewrap was present at startup. Fixed for the process
+	// lifetime — unlike resource limits, bwrap doesn't stop existing.
+	sandboxOK bool
 	// resourceLimitsOK: systemd-run --user --scope confirmed working at
 	// startup. Can flip false at runtime if a job discovers it stopped
 	// working (see the "Failed to connect to bus" handling in Execute) —
@@ -41,11 +44,45 @@ type Desk struct {
 	resourceLimitsOK atomic.Bool
 }
 
-func NewDesk(tools map[string]*Tool, q *Queue, dataDir string, settings *Settings, resourceLimitsOK bool) *Desk {
-	d := &Desk{tools: tools, queue: q, dataDir: dataDir, settings: settings}
+func NewDesk(tools map[string]*Tool, q *Queue, dataDir string, settings *Settings, sandboxOK, resourceLimitsOK bool) *Desk {
+	d := &Desk{tools: tools, queue: q, dataDir: dataDir, settings: settings, sandboxOK: sandboxOK}
 	d.resourceLimitsOK.Store(resourceLimitsOK)
 	q.desk = d
 	return d
+}
+
+// enforcement reports whether each guarantee the desk advertises is
+// actually in force right now, so an operator can check without reading
+// the startup log — and so a monitoring probe can watch one boolean.
+//
+// "degraded" covers only mechanisms the desk tried to use and couldn't:
+// the sandbox and the per-job caps. Auth being off is a deployment choice
+// rather than a failure, so it lands in warnings without setting degraded.
+func (d *Desk) enforcement() map[string]any {
+	sandbox := d.sandboxOK
+	limits := d.resourceLimitsOK.Load()
+
+	warnings := []string{}
+	if !sandbox {
+		warnings = append(warnings, "bubblewrap not found: tools run unsandboxed, and network:false "+
+			"is advisory only rather than enforced by the kernel")
+	}
+	if !limits {
+		warnings = append(warnings, "systemd-run --user --scope not usable: per-job memory and "+
+			"task-count limits are not enforced")
+	}
+	if !d.settings.AuthEnabled {
+		warnings = append(warnings, "auth disabled: anything that can reach this port can submit jobs")
+	}
+
+	return map[string]any{
+		"strict":          d.settings.Strict,
+		"sandbox":         sandbox,
+		"resource_limits": limits,
+		"auth":            d.settings.AuthEnabled,
+		"degraded":        !sandbox || !limits,
+		"warnings":        warnings,
+	}
 }
 
 func main() {
@@ -88,7 +125,10 @@ func main() {
 		"SQLite file for durable jobs + idempotency_key dedup (default: <data>/deskbox.db)")
 	postgresDSN := flag.String("postgres-dsn", settings.PostgresDSN,
 		"Postgres DSN for durable jobs + idempotency_key dedup (only used with -store=postgres; secret, keep it in .env, not deskbox.yaml)")
+	strict := flag.Bool("strict", settings.Strict,
+		"refuse to start, and refuse to run jobs, when sandboxing or per-job resource limits are unavailable, instead of degrading them to advisory")
 	flag.Parse()
+	settings.Strict = *strict
 
 	if settings.AuthEnabled && settings.AuthToken == "" {
 		log.Fatalf("DESKBOX_AUTH_ENABLED is set but DESKBOX_AUTH_TOKEN is empty")
@@ -105,7 +145,8 @@ func main() {
 	}
 	log.Printf("deskbox agent-desk %s: loaded %d tool(s) from %s", version, len(tools), *toolsDir)
 
-	if hasBwrap() {
+	sandboxOK := hasBwrap()
+	if sandboxOK {
 		log.Printf("sandbox: bubblewrap available — network isolation active")
 	} else {
 		log.Printf("sandbox: WARNING bubblewrap NOT found — network:false enforced as advisory only")
@@ -118,6 +159,25 @@ func main() {
 	} else {
 		log.Printf("WARN: systemd-run --user --scope not usable here (no user D-Bus session? see README) — " +
 			"job memory/task-count limits are NOT enforced")
+	}
+
+	// Every degradation above fails open: loudly logged, but open. -strict
+	// turns them into a refusal, for a deployment where "the sandbox wasn't
+	// available so we ran the tool anyway" is not an acceptable outcome.
+	if settings.Strict {
+		var missing []string
+		if !sandboxOK {
+			missing = append(missing, "bubblewrap (the sandbox itself)")
+		}
+		if !resourceLimitsOK {
+			missing = append(missing, "systemd-run --user --scope (per-job memory and task caps)")
+		}
+		if len(missing) > 0 {
+			log.Fatalf("-strict: refusing to start because these enforcement mechanisms are "+
+				"unavailable: %s. Install them, or drop -strict to run with those guarantees "+
+				"downgraded to advisory.", strings.Join(missing, "; "))
+		}
+		log.Printf("strict: enabled — a job will fail rather than run with degraded enforcement")
 	}
 
 	// JobStore is an interface (store.go): sqlite and postgres both ship
@@ -161,7 +221,7 @@ func main() {
 	q.Start()
 	defer q.Stop()
 
-	d := NewDesk(tools, q, *dataDir, settings, resourceLimitsOK)
+	d := NewDesk(tools, q, *dataDir, settings, sandboxOK, resourceLimitsOK)
 
 	if n, err := q.Resume(); err != nil {
 		log.Printf("resume from store: %v", err)
@@ -215,6 +275,7 @@ func (d *Desk) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s["service"] = "deskbox-agent-desk"
 	s["version"] = version
 	s["tools"] = len(d.tools)
+	s["enforcement"] = d.enforcement()
 	writeJSON(w, http.StatusOK, s)
 }
 

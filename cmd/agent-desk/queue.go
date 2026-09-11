@@ -439,6 +439,10 @@ func (q *Queue) process(job *Job) {
 	switch {
 	case err == nil:
 		q.finish(job, result, nil)
+	case errors.Is(err, ErrEnforcement):
+		// Permanent for the same reason a contract violation is: the missing
+		// mechanism is process-wide, so retrying would fail identically.
+		q.finish(job, nil, err)
 	case errors.Is(err, ErrContract):
 		// Permanent: the agent's request (or the tool) violated the contract.
 		// No retry — the agent must fix its call, not hope the desk goes easy.

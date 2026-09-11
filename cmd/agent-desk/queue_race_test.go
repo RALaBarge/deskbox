@@ -173,7 +173,7 @@ execution: {mode: queued, max_retries: 0, timeout_ms: 20000}
 
 	q := NewQueue(1, &readingStore{})
 	NewDesk(tools, q, filepath.Join(dir, "data"),
-		&Settings{JobMemoryMax: "512M", JobTasksMax: 64}, false)
+		&Settings{JobMemoryMax: "512M", JobTasksMax: 64}, false, false)
 
 	job := &Job{ID: "job-cancel-race", Tool: "slow", Input: map[string]any{},
 		Status: StatusQueued, Created: time.Now().UTC()}

@@ -138,7 +138,7 @@ now enforces it.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /` | Service status + queue summary |
+| `GET /` | Service status, queue summary, and the `enforcement` block (which guarantees are actually being enforced right now) |
 | `GET /tools` | List tools + their contracts (what an agent may invoke) |
 | `GET /tools/{name}` | The tool's contract as JSON (authored as `tcs.yaml` on disk, re-decoded for the wire — every API response is JSON, no exceptions) |
 | `POST /tools/{name}` | Invoke a tool. Body: `{"input": {...}, "meta": {...}, "idempotency_key": "..."}`. Optional `?wait=<duration>` (e.g. `5s`) — see below. |
@@ -280,6 +280,66 @@ curl -X POST localhost:8080/tools/example-tool -d '{"input": {}}'
 | Transient tool failure | queue retry w/ exponential backoff | retried up to `max_retries` |
 | Tool hangs | per-job timeout | retried (timeout) |
 
+### Fail-open by default, `-strict` when that isn't acceptable
+
+Two of those rows depend on machinery that can simply be absent: without
+`bwrap` there is no sandbox, so `network: false` degrades to advisory, and
+without a usable `systemd-run --user --scope` there are no per-job memory
+and task caps. By default the desk **fails open** — it logs the degradation
+loudly and keeps serving, because a desk that refuses to run on a host
+missing one optional package is a desk nobody can adopt.
+
+Failing open is the wrong default for some deployments and the whole point
+is that enforcement is not a matter of trust, so `-strict` (or
+`DESKBOX_STRICT=true`) inverts it:
+
+```bash
+./bin/agent-desk -strict
+# 2026/09/11 22:24:30 -strict: refusing to start because these enforcement
+# mechanisms are unavailable: bubblewrap (the sandbox itself); systemd-run
+# --user --scope (per-job memory and task caps). Install them, or drop
+# -strict to run with those guarantees downgraded to advisory.
+```
+
+It holds at run time too, not only at startup. `systemd-run --user --scope`
+can pass the boot probe and stop working later — an SSH session going away,
+a container without full session infrastructure — and the desk's fail-open
+response is to disable the wrapper for the rest of its life. Under `-strict`
+that flag instead makes every subsequent job fail with
+`enforcement unavailable` rather than run uncapped. Those refusals are
+permanent, never retried: the missing mechanism is process-wide, so a second
+attempt would fail identically while burning the tool's retry budget.
+
+`-strict` covers only the mechanisms that fail open. Auth being off is a
+deployment choice rather than a missing mechanism, so it shows up as a
+warning but doesn't make the desk refuse to start.
+
+### Knowing which guarantees are live
+
+Whether or not you use `-strict`, `GET /` reports what is actually being
+enforced, so an operator (or an agent deciding how much to trust a result)
+never has to infer it from the logs:
+
+```json
+{
+  "enforcement": {
+    "strict": false,
+    "sandbox": false,
+    "resource_limits": false,
+    "auth": false,
+    "degraded": true,
+    "warnings": [
+      "bubblewrap not found: tools run unsandboxed, and network:false is advisory only rather than enforced by the kernel",
+      "systemd-run --user --scope not usable: per-job memory and task-count limits are not enforced",
+      "auth disabled: anything that can reach this port can submit jobs"
+    ]
+  }
+}
+```
+
+`degraded` is true when the sandbox or the resource caps are missing — the
+one field to check if you only check one.
+
 ## The bwrap layer (minimal by construction)
 
 Every job runs inside its own bubblewrap sandbox. Inside, the tool sees **only**:
@@ -345,6 +405,7 @@ DESKBOX_AUTH_TOKEN=some-long-random-string
 | `DESKBOX_POSTGRES_DSN` | Same as `-postgres-dsn` below; the flag wins if both are set. Only read when `-store=postgres`. |
 | `DESKBOX_JOB_MEMORY_MAX` | Per-job memory cap (systemd `MemoryMax` syntax, e.g. `512M`). Default `512M`. |
 | `DESKBOX_JOB_TASKS_MAX` | Per-job cap on forked processes/threads (systemd `TasksMax`), stops fork bombs. Default `64`. |
+| `DESKBOX_STRICT` | `true` to refuse to start, and refuse to run jobs, when the sandbox or per-job resource limits are unavailable, instead of degrading them to advisory. Same as `-strict`; the flag wins if both are set. Default off (fail open). |
 
 `.env` is gitignored. Never commit a real token, generate one per
 deployment (`openssl rand -hex 32` works fine).
@@ -394,7 +455,8 @@ so the session persists independent of any active login, then restart the
 desk. If `systemd-run` isn't usable at all, the desk detects that (once at
 startup, and again if it stops working mid-run) and disables the wrapper
 instead of failing every job — logged clearly either way, same as the
-`bwrap`-missing and store-unset cases.
+`bwrap`-missing and store-unset cases. Start with `-strict` if you would
+rather the desk refuse the work than run it uncapped.
 
 ## Idempotency and durable jobs (`JobStore`, pluggable)
 

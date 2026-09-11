@@ -22,6 +22,13 @@ import (
 // permanent — the desk does not retry them.
 var ErrContract = errors.New("contract violation")
 
+// ErrEnforcement marks a job refused because an enforcement mechanism the
+// desk promises under -strict is not available. It is permanent, not
+// retryable: the condition is process-wide (bubblewrap missing, the user
+// D-Bus session gone), so a second attempt would hit exactly the same wall
+// while burning the tool's retry budget and delaying the operator's answer.
+var ErrEnforcement = errors.New("enforcement unavailable")
+
 const (
 	// maxToolOutput bounds what a single job can hand back — stdout, or a
 	// declared out file. The result becomes a JSON document the desk holds
@@ -157,6 +164,18 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 // the job, which kills the running process (exec.CommandContext) instead of
 // letting it run to completion after the desk stopped caring about it.
 func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[string]any) (any, error) {
+	// Strict has to hold at run time, not only at startup: resourceLimitsOK
+	// starts true and can flip false mid-life when the user D-Bus session
+	// goes away (see the "Failed to connect to bus" handling below). A desk
+	// that passed its -strict startup check and then quietly began running
+	// jobs uncapped would be making exactly the promise -strict exists to
+	// stop it making.
+	if d.settings.Strict && !d.resourceLimitsOK.Load() {
+		return nil, fmt.Errorf("%w: per-job memory and task caps are unavailable "+
+			"(systemd-run --user --scope), and -strict refuses to run a job without them",
+			ErrEnforcement)
+	}
+
 	ctx, cancel := context.WithTimeout(parent, tool.Execution.Timeout())
 	defer cancel()
 
@@ -237,6 +256,14 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		cmd.Args = wrapped
 		// Inside the sandbox the tool's own folder is always bound here.
 		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR=/deskbox/tool")
+	} else if errors.Is(err, ErrContract) {
+		// The contract itself is malformed (a sandbox.in path escaping the
+		// workspace). That is the tool author's bug in either mode — running
+		// it unsandboxed would be the worst possible response.
+		return nil, err
+	} else if d.settings.Strict {
+		return nil, fmt.Errorf("%w: the sandbox could not be built (%v), and -strict "+
+			"refuses to run a tool unsandboxed", ErrEnforcement, err)
 	} else {
 		log.Printf("WARN: sandbox unavailable (%v); running unsandboxed (advisory only)", err)
 		// Unsandboxed, /deskbox/tool doesn't exist — a tool that reads its
@@ -275,8 +302,17 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		// still fails and goes through the tool's normal retry policy,
 		// exactly like any other transient infrastructure hiccup.
 		if scoped && strings.Contains(msg, "Failed to connect to bus") && d.resourceLimitsOK.CompareAndSwap(true, false) {
-			log.Printf("WARN: systemd-run --user --scope stopped working mid-run (%s); "+
-				"disabling job memory/task-count limits for the rest of this process's life", truncate(msg, 200))
+			if d.settings.Strict {
+				// Under -strict the flag is not a fail-open switch: it is what
+				// the check at the top of Execute reads, so every subsequent
+				// job is refused rather than run uncapped.
+				log.Printf("ERROR: systemd-run --user --scope stopped working mid-run (%s); "+
+					"-strict: refusing every further job until the desk is restarted "+
+					"with a working user D-Bus session", truncate(msg, 200))
+			} else {
+				log.Printf("WARN: systemd-run --user --scope stopped working mid-run (%s); "+
+					"disabling job memory/task-count limits for the rest of this process's life", truncate(msg, 200))
+			}
 		}
 		return nil, fmt.Errorf("tool exited with error: %s", truncate(msg, 500))
 	}
