@@ -8,6 +8,13 @@ Agents don't run tools directly. They call DeskBox, and DeskBox checks a
 sandbox, so the contract is enforced by the kernel, not by trusting the
 agent to follow it.
 
+It ships as a single static binary with no shared-library dependencies and
+runs on any Linux. A tool is just a program that reads one JSON document on
+stdin and writes one on stdout — any language, no SDK, nothing to import —
+so the only thing a given box needs is whatever runtime your own tools name.
+`agent-desk -check` tells you whether it has them before you trust it with
+work.
+
 ## Layout
 
 ```
@@ -152,6 +159,7 @@ now enforces it.
 | `POST /batches` | Fan out one job per item. Body: `{"tool": "...", "items": [{...}, {...}], "meta": {...}}` |
 | `GET /batches/{id}` | Batch progress: items done/total, broken down by status |
 | `GET /queue` | Queue depth, worker count, recent jobs |
+| `GET /preflight` | Whether this box actually has what every loaded tool declares it needs (the JSON form of `-check`) |
 
 Each job gets a stable workspace at `<data>/jobs/<id>/` with `in/` and `out/`.
 `out/result.json` (or whatever `sandbox.out` declares) is a real file. Tail it
@@ -362,17 +370,41 @@ symlinks must be bound alongside `/usr` or the ELF interpreter can't
 resolve and `execvp` fails with ENOENT. See `known.md` for a separate
 Ubuntu-only AppArmor gotcha (system config, not a DeskBox bug).
 
-## Build & run
+## Build, install, ship
 
 ```bash
-# requires Go 1.22+
-go build -o bin/agent-desk ./cmd/agent-desk
-./bin/agent-desk -addr :8080                   # -workers defaults to 10, -tools to ./tools
-
-# optional: the adapter for wrapping pre-existing CLIs. Install it somewhere
-# the sandbox can see — /usr is bound read-only, a home dir is not.
-go build -o /usr/local/bin/tcs-shim ./cmd/tcs-shim
+make build      # static binaries into bin/
+make test       # go vet + go test -race
+make check      # ask this box whether it can actually run your tools
+make install    # into /usr/local/bin (PREFIX= to change)
+make dist       # release tarballs for linux/amd64 + linux/arm64, with SHA256SUMS
 ```
+
+Both binaries are built `CGO_ENABLED=0` and are statically linked. That is
+deliberate and it is the whole portability story: the SQLite driver is pure
+Go (`modernc.org/sqlite`), so there is no libc to match, no shared object to
+be missing, and one binary runs on any Linux of the same architecture —
+glibc or musl, old distro or new. `make dist` cross-compiles both
+architectures from any machine with a Go toolchain; nothing needs a
+container or a matching build host.
+
+Building from source needs **Go 1.25+** — that floor comes from the
+dependencies (`modernc.org/sqlite` and `pgx` both declare it), not from the
+desk's own code. Running a released binary needs no toolchain at all, which
+is the point: `tar -xzf`, then run it.
+
+```bash
+tar -xzf deskbox-v0.1.0-linux-amd64.tar.gz
+cd deskbox-v0.1.0-linux-amd64
+./agent-desk -version
+./agent-desk -check                            # before you trust it with work
+./agent-desk -addr :8080                       # -workers defaults to 10, -tools to ./tools
+```
+
+`tcs-shim` must be installed somewhere **under `/usr`** (`/usr/local/bin` is
+what `make install` uses). The sandbox binds `/usr` read-only and does not
+bind home directories, so a `tcs-shim` in `~/bin` is invisible to every
+shimmed tool — `-check` catches exactly this.
 
 Write a `tcs.yaml` + `run.sh` under `tools/<name>/` following the conventions
 above and the desk will pick it up — or start from one of the samples:
@@ -380,6 +412,79 @@ above and the desk will pick it up — or start from one of the samples:
 ```bash
 cp -r examples/tools/greet-python tools/
 ```
+
+### `-check`: does this box have what the tools need?
+
+The desk is portable; *tools* are not, and a tool is only as portable as the
+runtime it names. `-check` resolves every tool's declared dependencies
+against this machine and exits non-zero if any of them is unusable:
+
+```
+$ ./agent-desk -check
+greet-python
+  ok   interpreter python3    /usr/bin/python3
+grep-shim
+  ok   interpreter /bin/sh    /bin/sh
+  ok   shim        tcs-shim   /usr/local/bin/tcs-shim
+  ok   command     grep       /usr/bin/grep
+jq-filter
+  FAIL command     jq         NOT FOUND
+       not found on the desk's PATH
+       (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
+
+1 of 7 dependencies unusable on this box.
+```
+
+Everything it checks is *declared*, never inferred from the body of a shell
+script: a run script's shebang, and a `shim.yaml`'s `exec[0]` plus the
+`tcs-shim` binary itself. Guessing at shell semantics would produce
+confident wrong answers, which is worse than no check.
+
+Two things it resolves that a quick `command -v` does not:
+
+- It looks up against **the PATH the desk hands every job**, not the PATH of
+  the shell you ran it from. A runtime in `~/bin` is on your PATH and on no
+  job's PATH; checking your own would call a broken box ready.
+- It flags a runtime that exists but sits **outside the paths the sandbox
+  binds** (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`) — a tarball install
+  under `/opt`, Homebrew on Linux, `nix`, anything in `$HOME`. It is plainly
+  installed and it does not exist inside the sandbox, which without this
+  check surfaces as a baffling `ENOENT` on the first job. That is a hard
+  failure on a host with bubblewrap and a portability warning on one
+  without, and it is reported as whichever it actually is.
+
+The same report is served as JSON at `GET /preflight`, so an agent that just
+got a confusing tool failure — or an operator without shell access to the
+box — can ask the running desk what it is missing. The desk also logs any
+problems at startup rather than waiting for the first job to hit them.
+
+### Running it as a service
+
+```ini
+# ~/.config/systemd/user/deskbox.service
+[Unit]
+Description=DeskBox agent desk
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/agent-desk -addr 127.0.0.1:8080 -tools %h/deskbox/tools
+WorkingDirectory=%h/deskbox
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now deskbox
+loginctl enable-linger $(whoami)   # keeps the user session — and per-job
+                                   # resource limits — alive without a login
+```
+
+A **user** service, not a system one, is the intended shape: enforcement is
+scoped to the OS user running the desk, and per-job cgroup limits go through
+`systemd-run --user`, which needs that user's session to exist. `enable-linger`
+is what makes it survive logout.
 
 ## Settings (.env, optional)
 
@@ -534,6 +639,12 @@ through the interface.
       binary still gets the full sandbox/audit/schema enforcement
 - [x] Example tools in `examples/tools/` proving the language-agnostic
       claim concretely: Python, Perl, and two shimmed CLIs
+- [x] `-strict`: refuse to start, and refuse to run jobs, rather than
+      silently downgrading the sandbox or per-job caps to advisory; `GET /`
+      reports which guarantees are live either way
+- [x] Shippable on any Linux: static CGO-free binaries for amd64/arm64 via
+      `make dist`, `-check` to tell an operator up front which runtimes a
+      box is missing or has installed where the sandbox can't see them
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 

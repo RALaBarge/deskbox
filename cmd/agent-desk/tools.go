@@ -84,6 +84,18 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 		return nil, fmt.Errorf("abs %s: %w", dir, err)
 	}
 	entries, err := os.ReadDir(abs)
+	if os.IsNotExist(err) {
+		// A fresh install has no tools yet: someone who just unpacked a
+		// release and ran the binary should get a desk that starts and can
+		// be looked at, not a hard exit before it prints anything useful.
+		// The directory being unreadable (permissions, not a directory) is
+		// still an error — that one is a misconfiguration, not an empty
+		// starting point.
+		log.Printf("WARN: tools directory %s does not exist — no tools loaded; "+
+			"create it and drop a folder with a tcs.yaml in it, or start from "+
+			"an example: cp -r examples/tools/greet-python %s/", dir, dir)
+		return map[string]*Tool{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}

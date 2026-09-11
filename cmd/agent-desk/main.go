@@ -17,7 +17,21 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+// version is overridable at build time so a shipped binary can say exactly
+// what it is:
+//
+//	go build -ldflags "-X main.version=v0.2.0 -X main.commit=$(git rev-parse --short HEAD)"
+var (
+	version = "0.1.0"
+	commit  = ""
+)
+
+func versionString() string {
+	if commit == "" {
+		return "deskbox agent-desk " + version
+	}
+	return "deskbox agent-desk " + version + " (" + commit + ")"
+}
 
 // maxWait caps how long any single HTTP request (POST /tools/{name}?wait=,
 // GET /jobs/{id}/wait?timeout=) will block, so a caller can't hold a
@@ -127,16 +141,28 @@ func main() {
 		"Postgres DSN for durable jobs + idempotency_key dedup (only used with -store=postgres; secret, keep it in .env, not deskbox.yaml)")
 	strict := flag.Bool("strict", settings.Strict,
 		"refuse to start, and refuse to run jobs, when sandboxing or per-job resource limits are unavailable, instead of degrading them to advisory")
+	check := flag.Bool("check", false,
+		"resolve every tool's declared dependencies against this box, print the result, and exit (0 if everything a tool needs is present and reachable from inside the sandbox)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	settings.Strict = *strict
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	if settings.AuthEnabled && settings.AuthToken == "" {
 		log.Fatalf("DESKBOX_AUTH_ENABLED is set but DESKBOX_AUTH_TOKEN is empty")
 	}
-	if settings.AuthEnabled {
-		log.Printf("auth: enabled — requests need Authorization: Bearer <token>")
-	} else {
-		log.Printf("auth: disabled — anything that can reach %s can submit jobs", *addr)
+	// -check never serves, so the listener's auth posture is not part of the
+	// question it answers.
+	if !*check {
+		if settings.AuthEnabled {
+			log.Printf("auth: enabled — requests need Authorization: Bearer <token>")
+		} else {
+			log.Printf("auth: disabled — anything that can reach %s can submit jobs", *addr)
+		}
 	}
 
 	tools, err := LoadTools(*toolsDir)
@@ -159,6 +185,41 @@ func main() {
 	} else {
 		log.Printf("WARN: systemd-run --user --scope not usable here (no user D-Bus session? see README) — " +
 			"job memory/task-count limits are NOT enforced")
+	}
+
+	// Preflight: does this box actually have what the tools declare they
+	// need, and can the sandbox see it? This is the difference between a
+	// desk that fails on its first job with a bare ENOENT and one that says
+	// "python3 is not installed" before it ever accepts a request.
+	deps := Preflight(tools)
+	problems := PreflightProblems(deps)
+	if *check {
+		fmt.Print(FormatPreflight(deps, sandboxOK))
+		fatal := 0
+		for _, d := range problems {
+			if d.Fatal(sandboxOK) {
+				fatal++
+			}
+		}
+		switch {
+		case fatal > 0:
+			fmt.Printf("\n%d of %d dependencies unusable on this box.\n", fatal, len(deps))
+			os.Exit(1)
+		case len(problems) > 0:
+			fmt.Printf("\n%d dependencies check out; %d warning(s) above.\n", len(deps), len(problems))
+		case len(deps) == 0:
+			fmt.Printf("no tool dependencies to check: %d tool(s) loaded from %s.\n",
+				len(tools), *toolsDir)
+		default:
+			fmt.Printf("\nall %d dependencies check out.\n", len(deps))
+		}
+		return
+	}
+	if len(problems) > 0 {
+		log.Printf("preflight: %d tool dependency problem(s) — run with -check for the full report:\n%s",
+			len(problems), FormatPreflight(problems, sandboxOK))
+	} else if len(deps) > 0 {
+		log.Printf("preflight: all %d declared tool dependencies present and reachable inside the sandbox", len(deps))
 	}
 
 	// Every degradation above fails open: loudly logged, but open. -strict
@@ -244,6 +305,7 @@ func main() {
 	mux.HandleFunc("POST /batches", d.handleCreateBatch)
 	mux.HandleFunc("GET /batches/{id}", d.handleGetBatch)
 	mux.HandleFunc("GET /queue", d.handleQueueStats)
+	mux.HandleFunc("GET /preflight", d.handlePreflight)
 
 	var handler http.Handler = mux
 	if settings.AuthEnabled {
@@ -775,6 +837,31 @@ func defaultDataDir() string {
 		return filepath.Join(os.TempDir(), "deskbox-data")
 	}
 	return filepath.Join(home, ".local", "share", "deskbox")
+}
+
+// handlePreflight reports the same dependency resolution -check prints, as
+// JSON, so an operator (or an agent that just got a confusing tool failure)
+// can ask a running desk what it is missing without shell access to the box.
+func (d *Desk) handlePreflight(w http.ResponseWriter, r *http.Request) {
+	deps := Preflight(d.tools)
+	problems := 0
+	unusable := 0
+	for _, dep := range deps {
+		if dep.Status != PreflightOK {
+			problems++
+		}
+		if dep.Fatal(d.sandboxOK) {
+			unusable++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sandboxed":    d.sandboxOK,
+		"path":         sandboxPath,
+		"dependencies": deps,
+		"problems":     problems,
+		"unusable":     unusable,
+		"ok":           unusable == 0,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

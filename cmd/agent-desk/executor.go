@@ -37,6 +37,13 @@ const (
 	maxToolOutput = 32 << 20 // 32 MiB
 	// maxToolStderr bounds the diagnostic text that becomes job.Error.
 	maxToolStderr = 64 << 10
+	// sandboxPath is the PATH every job gets — sandboxed or not. It is
+	// deliberately the system PATH and nothing else: whatever was on the
+	// operator's PATH when they started the desk must not change what a
+	// tool can find, or the same contract resolves differently depending
+	// on who launched the desk. Preflight resolves against this same value
+	// so its answer is the one the job will actually get.
+	sandboxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
 // cappedBuffer accumulates up to max bytes, then drops the rest while still
@@ -236,7 +243,7 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 	cmd.Stderr = errBuf
 	// Fully-controlled env: nothing from the host shell leaks into the sandbox.
 	cmd.Env = []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"PATH=" + sandboxPath,
 		"HOME=/tmp",
 		"LANG=C.UTF-8",
 		"TERM=dumb",
