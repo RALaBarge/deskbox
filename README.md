@@ -32,8 +32,10 @@ deskbox/
 
 No tools ship in `tools/` — that space is yours alone, and examples that
 auto-loaded into it would undercut the point. Working samples live in
-[`examples/tools/`](examples/tools/) (Python, JavaScript, and two built on
+[`examples/tools/`](examples/tools/) (Python, Perl, and two built on
 `tcs-shim` that wrap `jq` and `grep` with no glue code); copy what you want.
+They depend only on things a stock Linux install already has, so they run
+on any box rather than only the one they were written on.
 
 A folder is a tool iff it contains `tcs.yaml` + an executable `run.sh|run.py|run`.
 
@@ -469,7 +471,7 @@ through the interface.
       argv-array exec so values can't inject a shell, and the wrapped
       binary still gets the full sandbox/audit/schema enforcement
 - [x] Example tools in `examples/tools/` proving the language-agnostic
-      claim concretely: Python, JavaScript, and two shimmed CLIs
+      claim concretely: Python, Perl, and two shimmed CLIs
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 

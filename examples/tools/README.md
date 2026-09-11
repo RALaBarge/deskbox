@@ -9,12 +9,24 @@ that. Copy what's useful:
 cp -r examples/tools/greet-python tools/
 ```
 
-| Tool | Makes the point that… |
-|---|---|
-| `greet-python` | a tool is just a program that reads JSON on stdin and writes JSON on stdout — no SDK, no import, no dependency on the desk |
-| `wordcount-node` | the desk genuinely does not care about the language; this is JavaScript next to Python and the desk can't tell |
-| `jq-filter` | a pre-existing CLI that never heard of the desk can be adopted with **no glue code at all**, via `tcs-shim` + a `shim.yaml` |
-| `grep-shim` | the shim handles the awkward real-world parts: optional flags, plain-text output, and a tool whose non-zero exit is a legitimate answer |
+| Tool | Makes the point that… | Needs |
+|---|---|---|
+| `greet-python` | a tool is just a program that reads JSON on stdin and writes JSON on stdout — no SDK, no import, no dependency on the desk | `python3` |
+| `wordcount-perl` | the desk genuinely does not care about the language; this is Perl next to Python and the desk can't tell | `perl` only |
+| `jq-filter` | a pre-existing CLI that never heard of the desk can be adopted with **no glue code at all**, via `tcs-shim` + a `shim.yaml` | `jq` installed |
+| `grep-shim` | the shim handles the awkward real-world parts: optional flags, plain-text output, and a tool whose non-zero exit is a legitimate answer | `grep` |
+
+These are meant to run on *any* Linux box, not just the one they were
+written on, so the dependency column is deliberately boring. `grep` is
+POSIX and `perl` ships in the base of essentially every distribution;
+`wordcount-perl` uses `JSON::PP`, which has been a core module since Perl
+5.14 and is pure Perl — no XS, no shared object to be missing. `python3`
+is everywhere in practice but can be absent from minimal images. `jq` is
+the one genuine install.
+
+The same instinct is worth applying to your own tools: prefer a runtime
+that is already present and a library with nothing linked, or ship a
+static binary that needs neither.
 
 ## Wrapping a tool you didn't write (`tcs-shim`)
 
@@ -119,18 +131,40 @@ job, exactly as it would for a hand-written tool.
 ## The path trap (read this before wondering why your tool won't run)
 
 The sandbox binds `/usr`, `/bin`, `/sbin`, `/lib` and `/lib64` read-only
-and **nothing else**. A binary or interpreter living anywhere else is
-invisible inside it. This bites in practice: on the machine these examples
-were written on, `node` is at `/opt/node22/bin/node`, which a real
-sandboxed run cannot see, while `python3`, `jq` and `grep` are all under
-`/usr` and work fine.
+and **nothing else** — no `/opt`, no `/home`, no `/nix`, no
+`/home/linuxbrew`. An interpreter or binary living outside those paths
+simply does not exist inside the sandbox, and your tool fails with a
+confusing "not found" even though the thing is plainly installed on the
+host.
 
-Two ways out, both already supported:
+This is easy to trip over because several popular ways of installing
+runtimes put them outside `/usr`: tarball installs under `/opt`, Homebrew
+on Linux, `nix`, and anything in a home directory. It also means a tool
+that works on your machine can fail on another one that installed the same
+runtime differently — which is the real argument for keeping a tool's
+dependencies boring.
 
-1. Use an interpreter that lives under `/usr` (the usual case on a normal
-   distro install).
-2. Vendor the binary into the tool's own folder and call it through
-   `$DESKBOX_TOOL_DIR`, which the desk sets for every run — to
-   `/deskbox/tool` inside the sandbox, or the real folder path when
-   bubblewrap isn't available. The tool folder is always bound read-only,
-   so a vendored binary is always reachable.
+Three ways out, in order of preference:
+
+1. **Depend on nothing unusual.** A runtime that is part of the base system
+   is under `/usr` on every distribution. This is why the examples use
+   `perl`, `grep` and `python3` rather than something that needs
+   installing.
+2. **Ship a static binary** and vendor it into the tool's own folder. It
+   needs no interpreter and no bound path at all — a Go or Rust tool builds
+   to roughly 2 MB with zero shared-library dependencies. Call it through
+   `$DESKBOX_TOOL_DIR`, which the desk sets for every run: `/deskbox/tool`
+   inside the sandbox, the real folder path when bubblewrap isn't
+   available. The tool folder is always bound read-only, so a vendored
+   binary is always reachable.
+3. **Vendor a whole runtime** the same way, if you must. A bundled
+   JavaScript or Python runtime is 60–120 MB, so keep it out of git — a
+   `build.sh`/`fetch.sh` in the tool folder plus a `.gitignore` entry beats
+   committing the binary.
+
+Check where something actually lives before depending on it:
+
+```bash
+command -v perl      # /usr/bin/perl        — inside the sandbox
+command -v node      # /opt/node22/bin/node — NOT inside the sandbox
+```

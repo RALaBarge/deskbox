@@ -1,0 +1,41 @@
+name: wordcount-perl
+summary: |
+  Counts words, characters and lines in a block of text. Exists to show the
+  desk does not care what a tool is written in: this one is Perl, its
+  neighbour is Python, and the desk treats them identically because both
+  honour the same JSON convention.
+
+  Chosen to run anywhere rather than to be exotic. Perl ships in the base
+  of essentially every Linux distribution, and JSON::PP has been a core
+  module since Perl 5.14 — pure Perl, no XS, no shared objects, nothing to
+  install. (JSON::XS would be faster and would be a linked library; that is
+  the trade this example deliberately refuses.)
+
+  Note the run script has no extension — the desk accepts run.sh, run.py or
+  a bare `run`, and the shebang decides the interpreter.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [text]
+  properties:
+    text: { type: string }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [words, chars, lines]
+    properties:
+      words: { type: integer }
+      chars: { type: integer }
+      lines: { type: integer }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 1
+  timeout_ms: 10000
