@@ -59,5 +59,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: sudo make install
+      # Plain `sudo make install` drops PATH, so the go added by setup-go
+      # (under RUNNER_TOOL_CACHE, not sudo's secure_path) silently vanishes
+      # and `go build` inside `make install` fails with "go: not found" —
+      # reproduced on a clean Ubuntu box, not theoretical.
+      - run: sudo --preserve-env=PATH make install
       - run: make build && ./bin/agent-desk -check -tools examples/tools
