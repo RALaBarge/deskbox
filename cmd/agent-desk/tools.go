@@ -20,6 +20,7 @@ type Tool struct {
 	Output             OutputSpec    `yaml:"output"`          // what agents get back
 	AllowedSideEffects SideEffects   `yaml:"allowed_side_effects"`
 	Sandbox            SandboxSpec   `yaml:"sandbox,omitempty"`
+	Integrity          IntegritySpec `yaml:"integrity,omitempty"`
 	Execution          ExecutionSpec `yaml:"execution"`
 
 	dir     string // on-disk location
@@ -126,6 +127,14 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 			continue
 		}
 		t.runPath = run
+		// A tool whose script no longer matches what was vetted does not
+		// load at all. Skipping it (rather than loading and failing every job)
+		// means the desk's tool list only ever advertises tools it can
+		// stand behind.
+		if err := verifyIntegrity(&t); err != nil {
+			log.Printf("ERROR: refusing to load tool %q: %v", name, err)
+			continue
+		}
 		if _, dup := tools[t.Name]; dup {
 			log.Printf("WARN: skipping tool folder %q: name %q already loaded from another folder", name, t.Name)
 			continue

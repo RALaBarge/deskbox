@@ -199,6 +199,14 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 			ErrEnforcement)
 	}
 
+	// Re-checked per job, not only at load: the desk is a long-running
+	// process, and a script that changes an hour after startup is exactly
+	// the case a pin exists to catch. Hashing a small script per run costs
+	// microseconds against a tool that is about to fork anyway.
+	if err := verifyIntegrity(tool); err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := context.WithTimeout(parent, tool.Execution.Timeout())
 	defer cancel()
 

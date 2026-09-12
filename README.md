@@ -442,10 +442,54 @@ Not covered, by design or by limit:
   is the whole reason `tools/` ships empty.
 - **The desk itself is not sandboxed.** It is an ordinary process that
   binds a port and runs programs. Which is why it defaults to loopback.
-- **"Vetted" is a point in time.** The desk checks that a run script isn't
-  writable by other accounts, but nothing pins its *contents* — a tool you
-  read last month is whatever is on disk today. The same goes for what it
-  pulls in from `/usr`, which your package manager updates underneath it.
+- **What a tool pulls in from `/usr` is not pinned.** The script's own
+  contents can be (see below), but the interpreter and libraries it loads
+  are whatever your package manager last installed.
+
+### Integrity: making "I vetted this tool" outlast the moment you vetted it
+
+The desk refuses to load a run script other accounts can write, but that
+says nothing about its *contents*. A tool you read last month is whatever
+is on disk today — changed by an edit, a bad merge, a sync, or something
+that got in. Pin the hash and vetting stops being a memory:
+
+```bash
+./agent-desk -pin                  # prints a paste-ready block per tool
+```
+
+```yaml
+# tcs.yaml
+integrity:
+  run_sha256: "fcf7a0581e5fbf3a7cf46c6dd0d65116ae58fc89a5d81b434104cde89bbc6550"
+```
+
+Checked in two places, because either alone has a hole. At **load**, a tool
+that doesn't match doesn't load at all — it never appears in `GET /tools`,
+so the desk only advertises tools it can stand behind. And **per job**,
+because the desk is a long-running process and a script edited an hour
+after startup would otherwise run with the desk still believing it was
+vetted:
+
+```
+job failed: integrity check failed: tools/greet-python/run.py has changed since it was vetted
+  pinned:  fcf7a058…6550
+  on disk: 0d043bb9…ce67
+  Read the script. If the change is yours and you have reviewed it, update
+  integrity.run_sha256 in tcs.yaml (agent-desk -pin prints the new value).
+```
+
+That failure is permanent — never retried. The file will not change between
+attempts, and retrying a tool you no longer recognise is the opposite of
+what the check is for.
+
+Two deliberate choices. **Pinning is opt-in per tool**: refusing to run
+everything that hasn't adopted it yet is how a check gets switched off
+wholesale. And **`-pin` only prints** — a flag that edited `tcs.yaml` would
+re-pin whatever happens to be on disk, which is exactly what the pin exists
+to catch. Read the script, then paste.
+
+The shipped examples are deliberately unpinned: they exist to be copied and
+edited. Pin your own copy once you have read it.
 
 ### Auth and the listen address
 
@@ -784,6 +828,9 @@ through the interface.
 - [x] Shippable on any Linux: static CGO-free binaries for amd64/arm64 via
       `make dist`, `-check` to tell an operator up front which runtimes a
       box is missing or has installed where the sandbox can't see them
+- [x] Tool integrity pinning: `integrity.run_sha256` in `tcs.yaml`, verified
+      at load and again per job, so "I vetted this" survives the moment it
+      was vetted; `-pin` prints the block, never writes it
 - [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 

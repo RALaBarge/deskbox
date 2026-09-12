@@ -439,6 +439,11 @@ func (q *Queue) process(job *Job) {
 	switch {
 	case err == nil:
 		q.finish(job, result, nil)
+	case errors.Is(err, ErrIntegrity):
+		// Permanent: the file on disk will not change between attempts,
+		// and retrying a tool you no longer recognise is the opposite of
+		// what the check is for.
+		q.finish(job, nil, err)
 	case errors.Is(err, ErrEnforcement):
 		// Permanent for the same reason a contract violation is: the missing
 		// mechanism is process-wide, so retrying would fail identically.

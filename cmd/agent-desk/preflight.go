@@ -68,15 +68,21 @@ func (d Dependency) Fatal(sandboxed bool) bool {
 // Preflight resolves every declared dependency of every loaded tool.
 func Preflight(tools map[string]*Tool) []Dependency {
 	var out []Dependency
+	for _, n := range sortedToolNames(tools) {
+		out = append(out, toolDependencies(tools[n])...)
+	}
+	return out
+}
+
+// sortedToolNames keeps every report — preflight, pins — in a stable order
+// so the same box prints the same thing twice.
+func sortedToolNames(tools map[string]*Tool) []string {
 	names := make([]string, 0, len(tools))
 	for n := range tools {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	for _, n := range names {
-		out = append(out, toolDependencies(tools[n])...)
-	}
-	return out
+	return names
 }
 
 func toolDependencies(t *Tool) []Dependency {

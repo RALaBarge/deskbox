@@ -184,6 +184,9 @@ func main() {
 		"refuse to start, and refuse to run jobs, when sandboxing or per-job resource limits are unavailable, instead of degrading them to advisory")
 	check := flag.Bool("check", false,
 		"resolve every tool's declared dependencies against this box, print the result, and exit (0 if everything a tool needs is present and reachable from inside the sandbox)")
+	pin := flag.Bool("pin", false,
+		"print a paste-ready integrity block (SHA-256 of each tool's run script) and exit — "+
+			"read the script first; this only prints, it never edits tcs.yaml")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	settings.Strict = *strict
@@ -199,7 +202,7 @@ func main() {
 	}
 	// -check never serves, so the listener's auth posture is not part of the
 	// question it answers.
-	if !*check {
+	if !*check && !*pin {
 		if settings.AuthEnabled {
 			log.Printf("auth: enabled — requests need Authorization: Bearer <token>")
 		} else {
@@ -210,7 +213,7 @@ func main() {
 	// How the desk is being run decides what the sandbox is worth. Both of
 	// these are operator choices rather than missing mechanisms, so they
 	// are reported here and refused only under -strict.
-	if !*check {
+	if !*check && !*pin {
 		log.Printf("user: tools will run as %s", describeUser())
 		if runningAsRoot() {
 			log.Printf("WARN: running as root — a tool runs as the same user the desk does, " +
@@ -251,6 +254,11 @@ func main() {
 	// need, and can the sandbox see it? This is the difference between a
 	// desk that fails on its first job with a bare ENOENT and one that says
 	// "python3 is not installed" before it ever accepts a request.
+	if *pin {
+		fmt.Print(FormatPins(tools))
+		return
+	}
+
 	deps := Preflight(tools)
 	problems := PreflightProblems(deps)
 	if *check {
