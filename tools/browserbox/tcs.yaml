@@ -1,0 +1,55 @@
+name: browserbox
+summary: |
+  Calls one tool exposed by a locally running BrowserBox relay + Chrome
+  extension against the operator's live browser session: DOM inspection,
+  clicks/fills, navigation, authenticated fetch (real session cookies),
+  clipboard, screenshots, network capture, JS/CSS injection, and PDF
+  extraction. See https://github.com/ralabarge/browserbox for the full
+  namespace.method reference, or GET http://127.0.0.1:9010/tools while the
+  relay is running.
+
+  This talks raw WebSocket rather than importing BrowserBox's own
+  `client.py`: that needs the third-party `websockets` package, and a
+  tool's own folder is the only thing always bound into the sandbox — a
+  pip-installed dependency living under a home directory is invisible
+  inside it (see examples/tools/README.md, "the path trap"). Requires
+  network:true to reach the relay's loopback socket at
+  ws://127.0.0.1:9009, which is why this tool declares network egress
+  where most tools here don't.
+
+  Needs, outside the sandbox: ws_relay.py running (`python3 ws_relay.py`
+  in the browserbox repo) and the extension loaded unpacked in Chrome with
+  a tab open. Both are the operator's to start; the desk only calls in.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [tool]
+  properties:
+    tool:
+      type: string
+      minLength: 3
+      # "namespace.method" — e.g. "dom.snapshot", "tabs.screenshot", "nav.go"
+    input: {}
+    timeout_s:
+      type: number
+      minimum: 1
+      maximum: 25
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    properties:
+      result: {}
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: queued
+  # A click, fill, or nav is a real side effect on the live browser — retrying
+  # one blindly on a transient relay hiccup could double-submit a form.
+  max_retries: 0
+  timeout_ms: 30000
