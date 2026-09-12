@@ -92,8 +92,22 @@ func (d *Desk) enforcement() map[string]any {
 		warnings = append(warnings, "systemd-run --user --scope not usable: per-job memory and "+
 			"task-count limits are not enforced")
 	}
-	if !d.settings.AuthEnabled {
-		warnings = append(warnings, "auth disabled: anything that can reach this port can submit jobs")
+	// "Auth is off" means something different depending on what the desk is
+	// listening on. On a 0600 unix socket the kernel has already answered
+	// the access question — only one account can open it — so reporting an
+	// open door there is just noise that trains an operator to ignore the
+	// list. On a TCP port it is the real warning, and how far it reaches
+	// decides how loud.
+	socket := isUnixSocket(d.settings.ListenAddr)
+	if !d.settings.AuthEnabled && !socket {
+		if listensBeyondLoopback(d.settings.ListenAddr) {
+			warnings = append(warnings, "auth disabled on a routable address ("+d.settings.ListenAddr+
+				"): anything that can route to this box can submit jobs")
+		} else {
+			warnings = append(warnings, "auth disabled: any local process, as any user on this box, "+
+				"can submit jobs that then run as "+describeUser()+
+				" — loopback stops the network, not other accounts")
+		}
 	}
 	root := runningAsRoot()
 	if root {
@@ -106,6 +120,10 @@ func (d *Desk) enforcement() map[string]any {
 		"sandbox":         sandbox,
 		"resource_limits": limits,
 		"auth":            d.settings.AuthEnabled,
+		"listen":          d.settings.ListenAddr,
+		// A 0600 socket is access control the kernel enforces on connect,
+		// which is a stronger statement than a shared secret in a header.
+		"user_scoped": socket,
 		// The account tools run as is the ceiling on what any of them can
 		// do — reported alongside the mechanisms because it bounds them.
 		"user":     describeUser(),
@@ -152,7 +170,8 @@ func main() {
 	// ask it to run a tool. Binding wider is a deliberate choice with a
 	// warning attached, not something you get by typing nothing.
 	addr := flag.String("addr", "127.0.0.1:8080",
-		"listen address (host:port); defaults to loopback — binding a routable address needs auth")
+		"listen address: host:port, or a path (containing /) for a unix socket created mode 0600 — "+
+			"the only binding actually scoped to one OS user")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
@@ -168,6 +187,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	settings.Strict = *strict
+	settings.ListenAddr = *addr
 
 	if *showVersion {
 		fmt.Println(versionString())
@@ -366,9 +386,18 @@ func main() {
 		handler = requireAuth(settings.AuthToken, mux)
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	log.Printf("agent-desk listening on %s", *addr)
-	log.Fatal(srv.ListenAndServe())
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	ln, err := listen(*addr)
+	if err != nil {
+		log.Fatalf("listen on %s: %v", *addr, err)
+	}
+	if isUnixSocket(*addr) {
+		log.Printf("agent-desk listening on unix:%s (mode 0600 — reachable only by %s)",
+			*addr, describeUser())
+	} else {
+		log.Printf("agent-desk listening on %s", *addr)
+	}
+	log.Fatal(srv.Serve(ln))
 }
 
 // requireAuth rejects any request without a matching Authorization: Bearer

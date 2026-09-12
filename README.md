@@ -381,6 +381,8 @@ never has to infer it from the logs:
     "sandbox": false,
     "resource_limits": false,
     "auth": false,
+    "listen": "127.0.0.1:8080",
+    "user_scoped": false,
     "user": "deskbox (uid 1000)",
     "root": false,
     "degraded": true,
@@ -440,21 +442,50 @@ Not covered, by design or by limit:
   is the whole reason `tools/` ships empty.
 - **The desk itself is not sandboxed.** It is an ordinary process that
   binds a port and runs programs. Which is why it defaults to loopback.
+- **"Vetted" is a point in time.** The desk checks that a run script isn't
+  writable by other accounts, but nothing pins its *contents* — a tool you
+  read last month is whatever is on disk today. The same goes for what it
+  pulls in from `/usr`, which your package manager updates underneath it.
 
 ### Auth and the listen address
 
 The desk binds `127.0.0.1:8080` by default. It runs programs on request and
 auth is off unless you turn it on, so a default reachable from the network
 would mean anyone who can route to the box can ask it to run a tool.
+Binding wider is a deliberate choice: the desk warns at startup unless auth
+is on, and `-strict` refuses outright.
 
-Binding anything wider is a deliberate choice: do it and the desk warns at
-startup unless auth is on, and `-strict` refuses to start at all.
+**Loopback stops the network, not other accounts.** Every local user can
+reach `127.0.0.1`, and a job any of them submits runs as the user the desk
+runs as. On a single-user machine that is the same thing; on a shared box
+it is not. Two ways to close it, and the first is stronger:
+
+```bash
+./agent-desk -addr /run/user/$(id -u)/deskbox.sock   # 0600 unix socket
+```
+
+An `-addr` containing `/` is a unix socket, created mode `0600`. The kernel
+checks the file mode on connect, so access is scoped to exactly one OS
+account with no shared secret to leak, rotate or forget — which is what
+"scoped to the user executing the desk call" actually means. Everything
+works unchanged; point clients at the socket:
+
+```bash
+curl --unix-socket /run/user/$(id -u)/deskbox.sock http://localhost/tools
+```
+
+The other way is a token, which is the right answer when something on
+another host legitimately needs to call the desk:
 
 ```bash
 # .env
 DESKBOX_AUTH_ENABLED=true
 DESKBOX_AUTH_TOKEN=$(openssl rand -hex 32)
 ```
+
+`GET /` reports which of these is in force (`listen`, `user_scoped`, `auth`),
+and the auth warning is phrased for the binding you actually chose rather
+than generically — a warning list you learn to ignore is worse than none.
 
 ## The bwrap layer (minimal by construction)
 

@@ -17,7 +17,11 @@ type Settings struct {
 	// Strict refuses to start, and refuses to run jobs, when an
 	// enforcement mechanism is unavailable — rather than logging a warning
 	// and continuing with the guarantee quietly downgraded to advisory.
-	Strict      bool
+	Strict bool
+	// ListenAddr is whatever -addr resolved to. The desk reports posture
+	// from it (a 0600 unix socket is already scoped to one account, so
+	// "auth is off" means something different there than on a TCP port).
+	ListenAddr  string
 	StoreKind   string // "sqlite" (default) | "postgres" | "memory"
 	SQLitePath  string // empty = <data-dir>/deskbox.db
 	PostgresDSN string
