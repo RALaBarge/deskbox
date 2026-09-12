@@ -43,6 +43,9 @@ CREATE INDEX IF NOT EXISTS jobs_batch_id_idx ON jobs (batch_id) WHERE batch_id I
 CREATE INDEX IF NOT EXISTS jobs_terminal_unacked_idx ON jobs (acked, status);
 `
 
+// NewPostgresStore connects to dsn and applies the schema (idempotently, via
+// IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so it's safe to call against
+// both a fresh database and one already running an older version of it.
 func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -61,6 +64,7 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
+// Close releases the underlying connection pool.
 func (s *PostgresStore) Close() error { return s.db.Close() }
 
 // postgresSelectCols is the fixed column list + order every SELECT/RETURNING
@@ -138,6 +142,8 @@ func (s *PostgresStore) Ack(id string, at time.Time) error {
 	return err
 }
 
+// Get fetches a job by id. The bool return distinguishes "not found" from an
+// error so callers don't have to sniff sql.ErrNoRows themselves.
 func (s *PostgresStore) Get(id string) (*Job, bool, error) {
 	q := `SELECT ` + postgresSelectCols + ` FROM jobs WHERE id = $1`
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -61,6 +61,9 @@ CREATE INDEX IF NOT EXISTS jobs_terminal_unacked_idx ON jobs (acked, status);
 // datetime type, so times round-trip as RFC3339Nano TEXT instead.
 const timeLayout = time.RFC3339Nano
 
+// NewSQLiteStore opens (or creates) the database at path and applies the
+// schema idempotently, so it's safe to call against both a fresh file and
+// one already running an older version of it.
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	// journal_mode(WAL): readers don't block the writer. busy_timeout: a
 	// caller that loses a brief write race waits instead of erroring
@@ -98,6 +101,7 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
+// Close releases the underlying connection.
 func (s *SQLiteStore) Close() error { return s.db.Close() }
 
 // Insert writes a new job row. If idempotencyKey is non-empty and a job
@@ -190,6 +194,8 @@ SELECT id, tool, idempotency_key, input, meta, status, attempt, max_retries,
        result, error, created_at, started_at, finished_at, batch_id, acked, acked_at
 `
 
+// Get fetches a job by id. The bool return distinguishes "not found" from an
+// error so callers don't have to sniff sql.ErrNoRows themselves.
 func (s *SQLiteStore) Get(id string) (*Job, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -65,6 +65,9 @@ type Desk struct {
 	resourceLimitsOK atomic.Bool
 }
 
+// NewDesk wires up a Desk from its already-loaded dependencies. sandboxOK and
+// resourceLimitsOK are passed in rather than probed here because they're
+// startup-time facts the caller already determined once, not per-request work.
 func NewDesk(tools map[string]*Tool, q *Queue, dataDir string, settings *Settings, sandboxOK, resourceLimitsOK bool) *Desk {
 	d := &Desk{tools: tools, queue: q, dataDir: dataDir, settings: settings, sandboxOK: sandboxOK}
 	d.resourceLimitsOK.Store(resourceLimitsOK)

@@ -107,6 +107,8 @@ type Queue struct {
 	cancels map[string]context.CancelFunc
 }
 
+// NewQueue builds an unstarted Queue backed by store. workers is clamped to
+// at least 1 so a misconfigured desk still makes progress instead of stalling.
 func NewQueue(workers int, store JobStore) *Queue {
 	if workers < 1 {
 		workers = 1
@@ -252,6 +254,7 @@ func (q *Queue) Resume() (int, error) {
 	return len(pending), nil
 }
 
+// Start launches the dispatcher and worker goroutines. Call once; Stop reverses it.
 func (q *Queue) Start() {
 	q.wg.Add(1)
 	go q.dispatch()
@@ -261,11 +264,14 @@ func (q *Queue) Start() {
 	}
 }
 
+// Stop closes the stop channel and blocks until every worker has exited.
 func (q *Queue) Stop() {
 	close(q.stop)
 	q.wg.Wait()
 }
 
+// Submit enqueues a single job. It's a thin wrapper over submit with no batch
+// id, kept separate from SubmitBatch so a lone job never carries batch semantics.
 func (q *Queue) Submit(tool *Tool, input, meta map[string]any, idempotencyKey string) (*Job, error) {
 	return q.submit(tool, input, meta, idempotencyKey, "")
 }
@@ -791,6 +797,9 @@ func (q *Queue) persistAck(job *Job) {
 	}
 }
 
+// Stats summarizes queue state for the status endpoint: counts by status plus
+// the 10 most recent jobs, capped so a long-running desk doesn't serialize its
+// entire history on every poll.
 func (q *Queue) Stats() map[string]any {
 	q.mu.Lock()
 	defer q.mu.Unlock()

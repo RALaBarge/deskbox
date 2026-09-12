@@ -28,10 +28,13 @@ type Tool struct {
 	raw     []byte // original tcs.yaml bytes (served at GET /tools/{name})
 }
 
+// OutputSpec declares the schema a tool's result must validate against.
 type OutputSpec struct {
 	Schema Schema `yaml:"schema,omitempty"`
 }
 
+// SideEffects declares the only ways a tool is allowed to touch the world
+// outside its input — everything else is what the sandbox exists to block.
 type SideEffects struct {
 	Files   []string `yaml:"files" json:"files"`     // empty = no file writes allowed
 	Network bool     `yaml:"network" json:"network"` // true = egress allowed
@@ -46,14 +49,19 @@ type SandboxSpec struct {
 	Out []string `yaml:"out" json:"out"` // files the tool may write (rw, tail-able)
 }
 
+// ExecutionSpec declares how a tool runs: queued through the worker pool
+// (default) or direct, and the retry/timeout budget either way.
 type ExecutionSpec struct {
 	Mode       string `yaml:"mode"` // "queued" (default) | "direct"
 	MaxRetries int    `yaml:"max_retries"`
 	TimeoutMS  int    `yaml:"timeout_ms"`
 }
 
+// IsQueued reports whether this tool goes through the worker queue rather
+// than running inline. An empty Mode defaults to queued.
 func (e ExecutionSpec) IsQueued() bool { return e.Mode == "" || e.Mode == "queued" }
 
+// Timeout returns the tool's execution timeout, defaulting to 30s when unset.
 func (e ExecutionSpec) Timeout() time.Duration {
 	if e.TimeoutMS <= 0 {
 		return 30 * time.Second
