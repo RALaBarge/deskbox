@@ -816,14 +816,29 @@ func (q *Queue) Stats() map[string]any {
 	}
 }
 
-func newJobID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return "job-" + hex.EncodeToString(b)
+// idBytes is 16, not 4. Four bytes is 32 bits, and the birthday bound puts
+// a collision at ~1% after only 10,000 jobs and ~39% after 65,536 — well
+// inside what a desk chewing through batches reaches in a week. A collision
+// is not cosmetic: the id is the job's primary key (the submit fails with a
+// constraint error), it is the workspace path under data/jobs/<id>/, and it
+// is the path segment in GET /jobs/{id}/out/{file}, so two jobs sharing one
+// would read and overwrite each other's output. Thirty-two bits is also
+// brute-forceable by anything that can reach the desk, which makes those
+// output files enumerable. 128 bits makes both problems disappear rather
+// than merely receding.
+const idBytes = 16
+
+func newID(prefix string) string {
+	b := make([]byte, idBytes)
+	// crypto/rand.Read returns an error only in situations where the
+	// program cannot continue safely; ignoring it would hand out an
+	// all-zero id, which every caller would then collide on.
+	if _, err := rand.Read(b); err != nil {
+		panic("deskbox: no entropy available for job ids: " + err.Error())
+	}
+	return prefix + hex.EncodeToString(b)
 }
 
-func newBatchID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return "batch-" + hex.EncodeToString(b)
-}
+func newJobID() string { return newID("job-") }
+
+func newBatchID() string { return newID("batch-") }

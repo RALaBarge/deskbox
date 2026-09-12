@@ -508,6 +508,19 @@ func parseWait(r *http.Request) (time.Duration, error) {
 // it wasn't governed by -workers like every other tool. Folding it into
 // the same path fixes that, at the cost of a direct call now possibly
 // waiting on a free worker slot under heavy load, same as a queued one.)
+// maxRequestBody bounds a submitted document. Without it json.Decode will
+// happily read a body of any size into memory, and the input then gets
+// copied again into the job workspace and again into the store — so an
+// unbounded body is an unbounded multiple of itself in RSS, on a daemon
+// that is otherwise careful to cap what a tool can hand back. The limit is
+// deliberately generous: an input document is arguments, not a payload.
+const maxRequestBody = 8 << 20 // 8 MiB
+
+// maxBatchItems caps fan-out. Every item becomes its own job with its own
+// row and its own workspace, so an accidental extra zero in a generated
+// batch should be refused with a clear message rather than absorbed.
+const maxBatchItems = 10_000
+
 func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	tool, ok := d.tools[name]
@@ -517,8 +530,8 @@ func (d *Desk) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req submitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body: " + err.Error()})
+	if err := decodeBody(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	if req.Input == nil {
@@ -734,8 +747,8 @@ type batchRequest struct {
 // nothing to lease from itself if it goes away and comes back.
 func (d *Desk) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	var req batchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body: " + err.Error()})
+	if err := decodeBody(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	tool, ok := d.tools[req.Tool]
@@ -745,6 +758,12 @@ func (d *Desk) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Items) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "items must be a non-empty array"})
+		return
+	}
+	if len(req.Items) > maxBatchItems {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error": fmt.Sprintf("batch has %d items, over the %d-item limit; split it",
+				len(req.Items), maxBatchItems)})
 		return
 	}
 
@@ -945,6 +964,29 @@ func (d *Desk) handlePreflight(w http.ResponseWriter, r *http.Request) {
 		"unusable":     unusable,
 		"ok":           unusable == 0,
 	})
+}
+
+// decodeBody reads a request body with a hard size ceiling. MaxBytesReader
+// (rather than checking Content-Length) is what makes the limit real: a
+// chunked request declares no length, and a lying one declares whatever it
+// likes.
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("request body is larger than the %d-byte limit", maxRequestBody)
+		}
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	// A second document in the same body means the client and the desk
+	// disagree about what was sent; taking the first and discarding the
+	// rest silently is how that disagreement becomes a bug much later.
+	if dec.More() {
+		return fmt.Errorf("request body has trailing content after the JSON document")
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
