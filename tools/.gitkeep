@@ -1,0 +1,8 @@
+This directory is yours.
+
+It ships empty on purpose: tools/ is the space you fill with programs you
+wrote or vetted, and auto-loading someone else's examples into it would
+undercut the one guarantee the project is built around. Copy what's useful
+instead:
+
+    cp -r examples/tools/greet-python tools/

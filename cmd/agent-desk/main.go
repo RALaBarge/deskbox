@@ -26,6 +26,13 @@ var (
 	commit  = ""
 )
 
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
 func versionString() string {
 	if commit == "" {
 		return "deskbox agent-desk " + version
@@ -203,15 +210,17 @@ func main() {
 		}
 		switch {
 		case fatal > 0:
-			fmt.Printf("\n%d of %d dependencies unusable on this box.\n", fatal, len(deps))
+			fmt.Printf("\n%d of %d %s unusable on this box.\n", fatal, len(deps),
+				plural(len(deps), "dependency", "dependencies"))
 			os.Exit(1)
 		case len(problems) > 0:
-			fmt.Printf("\n%d dependencies check out; %d warning(s) above.\n", len(deps), len(problems))
+			fmt.Printf("\n%d %s check out; %d warning(s) above.\n", len(deps),
+				plural(len(deps), "dependency", "dependencies"), len(problems))
 		case len(deps) == 0:
 			fmt.Printf("no tool dependencies to check: %d tool(s) loaded from %s.\n",
 				len(tools), *toolsDir)
 		default:
-			fmt.Printf("\nall %d dependencies check out.\n", len(deps))
+			fmt.Printf("\nall %d %s check out.\n", len(deps), plural(len(deps), "dependency", "dependencies"))
 		}
 		return
 	}

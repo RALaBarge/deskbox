@@ -15,6 +15,49 @@ so the only thing a given box needs is whatever runtime your own tools name.
 `agent-desk -check` tells you whether it has them before you trust it with
 work.
 
+## Quickstart
+
+```bash
+tar -xzf deskbox-v0.1.0-linux-amd64.tar.gz
+cd deskbox-v0.1.0-linux-amd64
+
+mkdir -p tools && cp -r examples/tools/greet-python tools/
+./agent-desk -check          # does this box have what that tool needs?
+./agent-desk -addr :8080
+```
+
+Then call it. `?wait=` turns invoke-and-poll into one request:
+
+```bash
+curl -sS -X POST 'localhost:8080/tools/greet-python?wait=5s' \
+  -H 'content-type: application/json' \
+  -d '{"input":{"name":"Ryan","excited":true}}'
+```
+
+```json
+{"id":"job-699c9b85","tool":"greet-python","status":"done","attempt":1,
+ "result":{"greeting":"Hello, Ryan!","length":12}, ...}
+```
+
+The contract is the point, so try breaking it. The tool never runs:
+
+```bash
+curl -sS -X POST localhost:8080/tools/greet-python \
+  -H 'content-type: application/json' -d '{"input":{"nam":"typo"}}'
+```
+
+```json
+{"error":"contract violation: input does not conform to the tool contract",
+ "violations":["$: missing required property \"name\"",
+               "$: unexpected property \"nam\" is not allowed by the contract"]}
+```
+
+That tool is 20 lines of Python that reads one JSON document on stdin and
+writes one on stdout. It imports nothing, knows nothing about DeskBox, and
+would behave identically piped to by hand — which is the whole design. Write
+your own the same way in any language, drop the folder in `tools/`, and it
+is a contract-enforced endpoint.
+
 ## Layout
 
 ```

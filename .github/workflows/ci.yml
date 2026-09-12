@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # The floor comes from the dependencies (modernc.org/sqlite and
+          # pgx both declare go 1.25), so read it from go.mod rather than
+          # pinning a second copy that can drift out of agreement with it.
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd)
+          if [ -n "$unformatted" ]; then echo "not gofmt'd:"; echo "$unformatted"; exit 1; fi
+      # -race, not plain go test: the queue's concurrency fixes are only
+      # observable under the detector, and several of these tests exist
+      # specifically to fail when one is reverted.
+      - run: make test
+
+  # Proves the portability claim on every push instead of when someone
+  # reports it broken: both architectures build, and the binaries are
+  # genuinely static (no interpreter, no shared libraries).
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make dist
+      - name: assert the binaries are static
+        run: |
+          set -eu
+          tar -xzf dist/*linux-amd64.tar.gz -C /tmp
+          bin=$(find /tmp -name agent-desk -type f | head -1)
+          file "$bin"
+          file "$bin" | grep -q 'statically linked' || { echo "NOT static"; exit 1; }
+          "$bin" -version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # The preflight check is only worth having if it is right about a stock
+  # machine. A clean Ubuntu runner is exactly the "any Linux box" the
+  # examples claim to run on, so resolve their dependencies for real.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo make install
+      - run: make build && ./bin/agent-desk -check -tools examples/tools
