@@ -23,7 +23,7 @@ cd deskbox-v0.1.0-linux-amd64
 
 mkdir -p tools && cp -r examples/tools/greet-python tools/
 ./agent-desk -check          # does this box have what that tool needs?
-./agent-desk -addr :8080
+./agent-desk                 # binds 127.0.0.1:8080
 ```
 
 Then call it. `?wait=` turns invoke-and-poll into one request:
@@ -361,9 +361,12 @@ that flag instead makes every subsequent job fail with
 permanent, never retried: the missing mechanism is process-wide, so a second
 attempt would fail identically while burning the tool's retry budget.
 
-`-strict` covers only the mechanisms that fail open. Auth being off is a
-deployment choice rather than a missing mechanism, so it shows up as a
-warning but doesn't make the desk refuse to start.
+`-strict` also refuses two things that are postures rather than missing
+mechanisms, because both erase what the mechanisms buy: running as **root**
+(every job would get uid 0 inside its sandbox), and listening on a
+**routable address with auth off** (anyone who can reach the box could
+submit jobs). Auth being off on a loopback bind is just a single-user dev
+machine, so that warns without refusing.
 
 ### Knowing which guarantees are live
 
@@ -378,6 +381,8 @@ never has to infer it from the logs:
     "sandbox": false,
     "resource_limits": false,
     "auth": false,
+    "user": "deskbox (uid 1000)",
+    "root": false,
     "degraded": true,
     "warnings": [
       "bubblewrap not found: tools run unsandboxed, and network:false is advisory only rather than enforced by the kernel",
@@ -388,8 +393,68 @@ never has to infer it from the logs:
 }
 ```
 
-`degraded` is true when the sandbox or the resource caps are missing — the
-one field to check if you only check one.
+`degraded` is true when the sandbox or the resource caps are missing, or
+when the desk is running as root — the one field to check if you only check
+one. `user` names the account tools will run as, which is the ceiling on
+what any of them can do.
+
+### What the sandbox does and does not cover
+
+Worth being precise, because the honest answer is "a lot, with two things
+that are yours to get right".
+
+Kernel-enforced, per job, nothing to trust:
+
+- no host filesystem — no home dirs, no `~/.ssh`, no `/var`, no service
+  secrets; only `/usr`-and-friends read-only, the declared input files, the
+  job's own `out/`, and the tool's folder
+- no network at all when `network: false` (`--unshare-net`)
+- no view of host processes, no shared memory, no controlling terminal
+  (`--unshare-pid`, `--unshare-ipc`, `--new-session`)
+- no host environment — `cmd.Env` is built from scratch, so no API key or
+  shell variable of yours reaches a tool
+- no surviving orphan if the desk dies (`--die-with-parent`, plus
+  `Pdeathsig` for the case where the desk is killed hard)
+- memory and process-count caps per job, where `systemd-run --user` works
+
+Not covered, by design or by limit:
+
+- **The account the desk runs as is the ceiling.** Nothing sets a
+  credential, so a tool runs as exactly the user the desk runs as. That is
+  what makes "a tool can't touch anything this account can't" true — and it
+  is why running the desk as root throws most of it away: the sandbox still
+  limits which paths exist, but everything inside is reached as uid 0, and
+  files the tool leaves in `out/` are root-owned. The desk now says so
+  loudly at startup, reports it in `GET /`, and refuses to start under
+  `-strict`.
+- **Syscalls are not filtered.** There is no seccomp profile; a tool can
+  make any syscall its uid is allowed to make. Namespaces limit what it can
+  *reach*, not what it can *ask for*.
+- **`network: true` is all-or-nothing.** A tool that declares egress gets
+  DNS and TLS roots bound and can talk to anything. There is no per-host
+  allowlist.
+- **A contract is a promise about shape, not intent.** The desk enforces
+  that a tool takes and returns what it says, writes only what it declared,
+  and reaches only what it asked for. It cannot tell you the tool does
+  something sensible with that. Vetting the tool is still your job — which
+  is the whole reason `tools/` ships empty.
+- **The desk itself is not sandboxed.** It is an ordinary process that
+  binds a port and runs programs. Which is why it defaults to loopback.
+
+### Auth and the listen address
+
+The desk binds `127.0.0.1:8080` by default. It runs programs on request and
+auth is off unless you turn it on, so a default reachable from the network
+would mean anyone who can route to the box can ask it to run a tool.
+
+Binding anything wider is a deliberate choice: do it and the desk warns at
+startup unless auth is on, and `-strict` refuses to start at all.
+
+```bash
+# .env
+DESKBOX_AUTH_ENABLED=true
+DESKBOX_AUTH_TOKEN=$(openssl rand -hex 32)
+```
 
 ## The bwrap layer (minimal by construction)
 
@@ -441,7 +506,7 @@ tar -xzf deskbox-v0.1.0-linux-amd64.tar.gz
 cd deskbox-v0.1.0-linux-amd64
 ./agent-desk -version
 ./agent-desk -check                            # before you trust it with work
-./agent-desk -addr :8080                       # -workers defaults to 10, -tools to ./tools
+./agent-desk                                   # 127.0.0.1:8080; -workers 10, -tools ./tools
 ```
 
 `tcs-shim` must be installed somewhere **under `/usr`** (`/usr/local/bin` is
@@ -620,10 +685,10 @@ picks one, and nothing else in the desk knows or cares which:
 | `memory` | none — job history and idempotency don't survive a restart | quick/throwaway runs |
 
 ```bash
-./bin/agent-desk -addr :8080                              # sqlite at ./data/deskbox.db
-./bin/agent-desk -addr :8080 -sqlite-path /var/lib/deskbox/jobs.db
-./bin/agent-desk -addr :8080 -store postgres -postgres-dsn "postgres://user:pass@host:5432/deskbox?sslmode=disable"
-./bin/agent-desk -addr :8080 -store memory
+./bin/agent-desk                              # sqlite at ./data/deskbox.db
+./bin/agent-desk -sqlite-path /var/lib/deskbox/jobs.db
+./bin/agent-desk -store postgres -postgres-dsn "postgres://user:pass@host:5432/deskbox?sslmode=disable"
+./bin/agent-desk -store memory
 ```
 
 Both backends create their own `jobs` table/file on startup (`CREATE TABLE IF

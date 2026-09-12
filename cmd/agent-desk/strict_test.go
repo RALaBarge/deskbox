@@ -117,10 +117,19 @@ func TestEnforcementStatus(t *testing.T) {
 	d.sandboxOK = true
 	d.settings.AuthEnabled = true
 	e = d.enforcement()
-	if e["degraded"] != false {
-		t.Errorf("a fully-enforcing desk must not report degraded: %#v", e)
+	// Running as root is itself a downgrade — the mechanisms are all
+	// present but everything inside the sandbox is reached as uid 0 — so
+	// on a root test runner the fully-enforcing case is the one warning
+	// that remains, not zero.
+	wantDegraded := runningAsRoot()
+	if e["degraded"] != wantDegraded {
+		t.Errorf("with every mechanism present, degraded should track root (%v): %#v", wantDegraded, e)
 	}
-	if w, _ := e["warnings"].([]string); len(w) != 0 {
+	w, _ := e["warnings"].([]string)
+	if wantDegraded && len(w) != 1 {
+		t.Errorf("expected exactly the root warning, got %#v", w)
+	}
+	if !wantDegraded && len(w) != 0 {
 		t.Errorf("expected no warnings, got %#v", w)
 	}
 }

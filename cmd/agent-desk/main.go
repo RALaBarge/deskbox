@@ -95,14 +95,23 @@ func (d *Desk) enforcement() map[string]any {
 	if !d.settings.AuthEnabled {
 		warnings = append(warnings, "auth disabled: anything that can reach this port can submit jobs")
 	}
+	root := runningAsRoot()
+	if root {
+		warnings = append(warnings, "running as root: tools run as uid 0 inside their sandbox, "+
+			"which is the one thing that makes the sandbox worth much less than it looks")
+	}
 
 	return map[string]any{
 		"strict":          d.settings.Strict,
 		"sandbox":         sandbox,
 		"resource_limits": limits,
 		"auth":            d.settings.AuthEnabled,
-		"degraded":        !sandbox || !limits,
-		"warnings":        warnings,
+		// The account tools run as is the ceiling on what any of them can
+		// do — reported alongside the mechanisms because it bounds them.
+		"user":     describeUser(),
+		"root":     root,
+		"degraded": !sandbox || !limits || root,
+		"warnings": warnings,
 	}
 }
 
@@ -137,7 +146,13 @@ func main() {
 		sqlitePathDefault = cfg.Store.SQLite.Path
 	}
 
-	addr := flag.String("addr", ":8080", "listen address (host:port)")
+	// Loopback by default, not ":8080". The desk runs programs on request,
+	// and auth is off unless someone turns it on, so a default that is
+	// reachable from the network means anyone who can route to the box can
+	// ask it to run a tool. Binding wider is a deliberate choice with a
+	// warning attached, not something you get by typing nothing.
+	addr := flag.String("addr", "127.0.0.1:8080",
+		"listen address (host:port); defaults to loopback — binding a routable address needs auth")
 	toolsDir := flag.String("tools", "tools", "directory of tool folders; each folder must contain tcs.yaml")
 	workerCount := flag.Int("workers", 10, "number of queued-execution workers")
 	dataDir := flag.String("data", defaultDataDir(), "job workspace root (jobs/<id>/in, jobs/<id>/out live here, tail-able)")
@@ -169,6 +184,24 @@ func main() {
 			log.Printf("auth: enabled — requests need Authorization: Bearer <token>")
 		} else {
 			log.Printf("auth: disabled — anything that can reach %s can submit jobs", *addr)
+		}
+	}
+
+	// How the desk is being run decides what the sandbox is worth. Both of
+	// these are operator choices rather than missing mechanisms, so they
+	// are reported here and refused only under -strict.
+	if !*check {
+		log.Printf("user: tools will run as %s", describeUser())
+		if runningAsRoot() {
+			log.Printf("WARN: running as root — a tool runs as the same user the desk does, " +
+				"so every job gets uid 0 inside its sandbox and leaves root-owned files behind. " +
+				"Run the desk as an unprivileged user; that is what makes 'a tool can't touch " +
+				"anything this account can't' true.")
+		}
+		if listensBeyondLoopback(*addr) && !settings.AuthEnabled {
+			log.Printf("WARN: listening on %s with auth disabled — anything that can route to "+
+				"this box can submit jobs to a daemon whose job is running programs. Set "+
+				"DESKBOX_AUTH_ENABLED/DESKBOX_AUTH_TOKEN, or bind 127.0.0.1.", *addr)
 		}
 	}
 
@@ -242,10 +275,22 @@ func main() {
 		if !resourceLimitsOK {
 			missing = append(missing, "systemd-run --user --scope (per-job memory and task caps)")
 		}
+		// Root is not a missing mechanism, it is a posture that erases what
+		// the mechanisms buy: the sandbox still limits which paths exist,
+		// but everything inside it is reached as uid 0. A desk that
+		// advertises strict enforcement while handing every tool root is
+		// making exactly the promise -strict exists to stop it making.
+		if runningAsRoot() {
+			missing = append(missing, "an unprivileged user to run tools as (the desk is running as root)")
+		}
+		if listensBeyondLoopback(*addr) && !settings.AuthEnabled {
+			missing = append(missing, fmt.Sprintf(
+				"either auth or a loopback bind (listening on %s with auth disabled)", *addr))
+		}
 		if len(missing) > 0 {
-			log.Fatalf("-strict: refusing to start because these enforcement mechanisms are "+
-				"unavailable: %s. Install them, or drop -strict to run with those guarantees "+
-				"downgraded to advisory.", strings.Join(missing, "; "))
+			log.Fatalf("-strict: refusing to start because enforcement would not actually "+
+				"hold here: %s. Fix those, or drop -strict to run with the corresponding "+
+				"guarantees downgraded to advisory.", strings.Join(missing, "; "))
 		}
 		log.Printf("strict: enabled — a job will fail rather than run with degraded enforcement")
 	}

@@ -90,12 +90,28 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return sandboxArgs(bw, tool, inDir, outDir, toolDir)
+}
 
+// sandboxArgs builds the argv given an already-resolved bwrap path. It is
+// split from bakeSandbox only so the hardening it applies can be asserted
+// on a machine that doesn't have bubblewrap installed — otherwise the test
+// that a flag like --new-session is still present skips exactly where it
+// is most likely to be quietly dropped.
+func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 	dstOut := "/deskbox/out"
 	args := []string{
 		bw, // absolute path — Go must exec this directly, no PATH lookup
 		"--die-with-parent",
 		"--unshare-pid", "--unshare-uts", "--unshare-ipc",
+		// setsid(), so the sandbox has no controlling terminal. bubblewrap's
+		// own documentation calls leaving this out a security risk: a
+		// process that shares the parent's terminal can push characters
+		// into it with the TIOCSTI ioctl, which the operator's shell then
+		// executes as if they had typed them. The desk hands every job
+		// pipes rather than a tty, so nothing here needs a terminal and
+		// this costs nothing.
+		"--new-session",
 	}
 
 	// System read-only base: toolchain + a bare minimum of /etc.
