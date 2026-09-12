@@ -283,6 +283,21 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		args = append(args, script)
 		wrapped := wrapWithResourceLimits(args, d.settings, d.resourceLimitsOK.Load())
 		scoped = len(wrapped) > len(args)
+		if scoped {
+			// systemd-run itself (not the sandboxed tool) needs these to reach
+			// the user bus — cmd.Env governs the whole exec'd chain, so without
+			// them here systemd-run fails with "Failed to connect to bus" on
+			// every real job even though the startup probe (canScopeJobs, which
+			// inherits the desk's own env) said scoping was available. Harmless
+			// if a tool sees them: /run isn't bound into the sandbox, so the
+			// path they name doesn't exist in there either way.
+			if v := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); v != "" {
+				cmd.Env = append(cmd.Env, "DBUS_SESSION_BUS_ADDRESS="+v)
+			}
+			if v := os.Getenv("XDG_RUNTIME_DIR"); v != "" {
+				cmd.Env = append(cmd.Env, "XDG_RUNTIME_DIR="+v)
+			}
+		}
 		cmd.Path = wrapped[0]
 		cmd.Args = wrapped
 		// Inside the sandbox the tool's own folder is always bound here.

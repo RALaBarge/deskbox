@@ -99,6 +99,29 @@ func TestNonStrictStillRunsDegraded(t *testing.T) {
 	}
 }
 
+// TestScopedJobsSeeTheHostsDBusSession is a regression test for a real gap:
+// canScopeJobs (the startup probe) inherits the desk process's own
+// environment, so it reports scoping available whenever DBUS_SESSION_BUS_
+// ADDRESS happens to be set at boot. A job's cmd.Env is a separately
+// constructed, fully-controlled list — if it doesn't forward that same
+// variable to the systemd-run wrapper, every real job fails with "Failed to
+// connect to bus" despite the desk having just claimed resource limits were
+// available.
+func TestScopedJobsSeeTheHostsDBusSession(t *testing.T) {
+	if !canScopeJobs() {
+		t.Skip("no working systemd-run --user --scope here, nothing to regress against")
+	}
+	tool, dataDir := strictTool(t)
+	d := strictDesk(t, dataDir, false, true)
+
+	job := &Job{ID: "job-scoped-dbus", Tool: tool.Name}
+	_, err := d.Execute(context.Background(), tool, job, map[string]any{})
+	if err != nil {
+		t.Fatalf("a job wrapped by systemd-run must reach the same bus the "+
+			"startup probe found, got %v", err)
+	}
+}
+
 // TestEnforcementStatus checks the shape GET / reports, since that block is
 // how an operator (or an agent deciding whether to trust the desk) learns
 // the guarantees are downgraded.
