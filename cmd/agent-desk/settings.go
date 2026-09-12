@@ -14,6 +14,16 @@ import (
 type Settings struct {
 	AuthEnabled bool
 	AuthToken   string
+	// Strict refuses to start, and refuses to run jobs, when an
+	// enforcement mechanism is unavailable — rather than logging a warning
+	// and continuing with the guarantee quietly downgraded to advisory.
+	Strict bool
+	// ListenAddr is whatever -addr resolved to. The desk reports posture
+	// from it (a 0600 unix socket is already scoped to one account, so
+	// "auth is off" means something different there than on a TCP port).
+	ListenAddr  string
+	StoreKind   string // "sqlite" (default) | "postgres" | "memory"
+	SQLitePath  string // empty = <data-dir>/deskbox.db
 	PostgresDSN string
 
 	// Per-job cgroup limits (via systemd-run --scope). bwrap's namespaces
@@ -68,6 +78,15 @@ func LoadSettings() (*Settings, error) {
 		authEnabled = b
 	}
 
+	strict := false
+	if v := os.Getenv("DESKBOX_STRICT"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("DESKBOX_STRICT=%q is not a valid boolean", v)
+		}
+		strict = b
+	}
+
 	memMax := os.Getenv("DESKBOX_JOB_MEMORY_MAX")
 	if memMax == "" {
 		memMax = "512M"
@@ -83,8 +102,14 @@ func LoadSettings() (*Settings, error) {
 	}
 
 	return &Settings{
-		AuthEnabled:  authEnabled,
-		AuthToken:    os.Getenv("DESKBOX_AUTH_TOKEN"),
+		AuthEnabled: authEnabled,
+		AuthToken:   os.Getenv("DESKBOX_AUTH_TOKEN"),
+		Strict:      strict,
+		// StoreKind/SQLitePath are left "" when unset — main.go falls back
+		// to deskbox.yaml and then the hardcoded default, in that order, so
+		// an env var must actually be set to win at this layer.
+		StoreKind:    os.Getenv("DESKBOX_STORE"),
+		SQLitePath:   os.Getenv("DESKBOX_SQLITE_PATH"),
 		PostgresDSN:  os.Getenv("DESKBOX_POSTGRES_DSN"),
 		JobMemoryMax: memMax,
 		JobTasksMax:  tasksMax,

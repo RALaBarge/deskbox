@@ -22,6 +22,54 @@ import (
 // permanent — the desk does not retry them.
 var ErrContract = errors.New("contract violation")
 
+// ErrEnforcement marks a job refused because an enforcement mechanism the
+// desk promises under -strict is not available. It is permanent, not
+// retryable: the condition is process-wide (bubblewrap missing, the user
+// D-Bus session gone), so a second attempt would hit exactly the same wall
+// while burning the tool's retry budget and delaying the operator's answer.
+var ErrEnforcement = errors.New("enforcement unavailable")
+
+const (
+	// maxToolOutput bounds what a single job can hand back — stdout, or a
+	// declared out file. The result becomes a JSON document the desk holds
+	// in memory, stores, and serves, so "however much the tool felt like
+	// printing" is not a size the desk can accept.
+	maxToolOutput = 32 << 20 // 32 MiB
+	// maxToolStderr bounds the diagnostic text that becomes job.Error.
+	maxToolStderr = 64 << 10
+	// sandboxPath is the PATH every job gets — sandboxed or not. It is
+	// deliberately the system PATH and nothing else: whatever was on the
+	// operator's PATH when they started the desk must not change what a
+	// tool can find, or the same contract resolves differently depending
+	// on who launched the desk. Preflight resolves against this same value
+	// so its answer is the one the job will actually get.
+	sandboxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+// cappedBuffer accumulates up to max bytes, then drops the rest while still
+// reporting success to the writer — a tool that overruns gets a clean
+// contract violation rather than an EPIPE mid-write, and the desk's heap
+// stays bounded regardless of what the tool does.
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	max      int64
+	overflow bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if !b.overflow {
+		if remaining := b.max - int64(b.buf.Len()); int64(len(p)) > remaining {
+			b.buf.Write(p[:remaining])
+			b.overflow = true
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string { return b.buf.String() }
+
 // bakeSandbox builds the bwrap argv for a tool run.
 //
 // The sandbox layer is minimal by construction. Inside it, the tool sees:
@@ -42,12 +90,28 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return sandboxArgs(bw, tool, inDir, outDir, toolDir)
+}
 
+// sandboxArgs builds the argv given an already-resolved bwrap path. It is
+// split from bakeSandbox only so the hardening it applies can be asserted
+// on a machine that doesn't have bubblewrap installed — otherwise the test
+// that a flag like --new-session is still present skips exactly where it
+// is most likely to be quietly dropped.
+func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 	dstOut := "/deskbox/out"
 	args := []string{
 		bw, // absolute path — Go must exec this directly, no PATH lookup
 		"--die-with-parent",
 		"--unshare-pid", "--unshare-uts", "--unshare-ipc",
+		// setsid(), so the sandbox has no controlling terminal. bubblewrap's
+		// own documentation calls leaving this out a security risk: a
+		// process that shares the parent's terminal can push characters
+		// into it with the TIOCSTI ioctl, which the operator's shell then
+		// executes as if they had typed them. The desk hands every job
+		// pipes rather than a tty, so nothing here needs a terminal and
+		// this costs nothing.
+		"--new-session",
 	}
 
 	// System read-only base: toolchain + a bare minimum of /etc.
@@ -117,8 +181,33 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 //   - any file written to out/ that is NOT declared in sandbox.out is a
 //     contract violation (permanent, no retry)
 //   - non-zero exit or timeout => retryable failure
-func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tool.Execution.Timeout())
+//
+// parent is the caller's cancellation source — Queue.process derives a
+// per-job context from it and cancels that context when an operator DELETEs
+// the job, which kills the running process (exec.CommandContext) instead of
+// letting it run to completion after the desk stopped caring about it.
+func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[string]any) (any, error) {
+	// Strict has to hold at run time, not only at startup: resourceLimitsOK
+	// starts true and can flip false mid-life when the user D-Bus session
+	// goes away (see the "Failed to connect to bus" handling below). A desk
+	// that passed its -strict startup check and then quietly began running
+	// jobs uncapped would be making exactly the promise -strict exists to
+	// stop it making.
+	if d.settings.Strict && !d.resourceLimitsOK.Load() {
+		return nil, fmt.Errorf("%w: per-job memory and task caps are unavailable "+
+			"(systemd-run --user --scope), and -strict refuses to run a job without them",
+			ErrEnforcement)
+	}
+
+	// Re-checked per job, not only at load: the desk is a long-running
+	// process, and a script that changes an hour after startup is exactly
+	// the case a pin exists to catch. Hashing a small script per run costs
+	// microseconds against a tool that is about to fork anyway.
+	if err := verifyIntegrity(tool); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(parent, tool.Execution.Timeout())
 	defer cancel()
 
 	// Job workspace is stable on disk (not tmp): the operator can tail -f the
@@ -168,12 +257,17 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 	// a second, duplicate run of the same job. Pdeathsig closes that no
 	// matter how violently the desk dies, without needing graceful shutdown.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	// Capped, not a plain Buffer: the desk runs outside the per-job cgroup
+	// scope, so a tool firehosing stdout would grow the *desk's* heap, not
+	// its own capped one — and on hosts where systemd-run isn't usable
+	// (the desk fails open there by design) there is no cap at all.
+	outBuf := &cappedBuffer{max: maxToolOutput}
+	errBuf := &cappedBuffer{max: maxToolStderr}
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
 	// Fully-controlled env: nothing from the host shell leaks into the sandbox.
 	cmd.Env = []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"PATH=" + sandboxPath,
 		"HOME=/tmp",
 		"LANG=C.UTF-8",
 		"TERM=dumb",
@@ -191,14 +285,36 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 		scoped = len(wrapped) > len(args)
 		cmd.Path = wrapped[0]
 		cmd.Args = wrapped
+		// Inside the sandbox the tool's own folder is always bound here.
+		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR=/deskbox/tool")
+	} else if errors.Is(err, ErrContract) {
+		// The contract itself is malformed (a sandbox.in path escaping the
+		// workspace). That is the tool author's bug in either mode — running
+		// it unsandboxed would be the worst possible response.
+		return nil, err
+	} else if d.settings.Strict {
+		return nil, fmt.Errorf("%w: the sandbox could not be built (%v), and -strict "+
+			"refuses to run a tool unsandboxed", ErrEnforcement, err)
 	} else {
 		log.Printf("WARN: sandbox unavailable (%v); running unsandboxed (advisory only)", err)
+		// Unsandboxed, /deskbox/tool doesn't exist — a tool that reads its
+		// own folder (vendored data, a shim's config) needs the real path
+		// or it silently breaks in exactly the advisory mode meant to be a
+		// degraded-but-working fallback.
+		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR="+toolDir)
 	}
 
 	start := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
 
+	// Canceled (an operator's DELETE /jobs/{id}) is checked ahead of
+	// DeadlineExceeded so the returned error is accurate; Queue.process
+	// decides the job's final status from job.Status, not from this
+	// message, so this mainly matters for logging/debugging clarity.
+	if ctx.Err() == context.Canceled {
+		return nil, fmt.Errorf("canceled after %s", elapsed.Round(time.Millisecond))
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("timeout after %s", elapsed.Round(time.Millisecond))
 	}
@@ -217,8 +333,17 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 		// still fails and goes through the tool's normal retry policy,
 		// exactly like any other transient infrastructure hiccup.
 		if scoped && strings.Contains(msg, "Failed to connect to bus") && d.resourceLimitsOK.CompareAndSwap(true, false) {
-			log.Printf("WARN: systemd-run --user --scope stopped working mid-run (%s); "+
-				"disabling job memory/task-count limits for the rest of this process's life", truncate(msg, 200))
+			if d.settings.Strict {
+				// Under -strict the flag is not a fail-open switch: it is what
+				// the check at the top of Execute reads, so every subsequent
+				// job is refused rather than run uncapped.
+				log.Printf("ERROR: systemd-run --user --scope stopped working mid-run (%s); "+
+					"-strict: refusing every further job until the desk is restarted "+
+					"with a working user D-Bus session", truncate(msg, 200))
+			} else {
+				log.Printf("WARN: systemd-run --user --scope stopped working mid-run (%s); "+
+					"disabling job memory/task-count limits for the rest of this process's life", truncate(msg, 200))
+			}
 		}
 		return nil, fmt.Errorf("tool exited with error: %s", truncate(msg, 500))
 	}
@@ -250,6 +375,13 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 			if !fi.Mode().IsRegular() {
 				return nil, fmt.Errorf("%w: declared output %q is not a regular file", ErrContract, f)
 			}
+			// Size-checked before reading: a declared out file is written
+			// inside the sandbox and can be arbitrarily large, and
+			// os.ReadFile would pull all of it into the desk's heap.
+			if fi.Size() > maxToolOutput {
+				return nil, fmt.Errorf("%w: declared output %q is %d bytes, over the %d-byte limit",
+					ErrContract, f, fi.Size(), maxToolOutput)
+			}
 			b, err := os.ReadFile(p)
 			if err == nil {
 				raw = b
@@ -264,6 +396,10 @@ func (d *Desk) Execute(tool *Tool, job *Job, input map[string]any) (any, error) 
 			return nil, fmt.Errorf("%w: output file is not valid JSON: %v", ErrContract, err)
 		}
 	} else {
+		if outBuf.overflow {
+			return nil, fmt.Errorf("%w: tool wrote more than %d bytes to stdout",
+				ErrContract, maxToolOutput)
+		}
 		out := strings.TrimSpace(outBuf.String())
 		if out == "" {
 			return nil, fmt.Errorf("%w: tool produced no output on stdout (contract requires a JSON document)", ErrContract)
@@ -337,7 +473,16 @@ func canScopeJobs() bool {
 	if _, err := exec.LookPath("systemd-run"); err != nil {
 		return false
 	}
-	cmd := exec.Command("systemd-run", "--user", "--scope", "--quiet",
+	// Bounded: this probe runs in main() before the HTTP server starts
+	// listening, so an unbounded Run() here means a wedged D-Bus session
+	// (which can hang rather than fail fast) stops the desk from ever
+	// serving, with no signal to the operator beyond a silent hang. A
+	// probe that should take milliseconds gets five seconds; past that,
+	// treat it as unusable and fail open, exactly like a probe that
+	// returned an error.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemd-run", "--user", "--scope", "--quiet",
 		"-p", "MemoryMax=16M", "--", "/bin/true")
 	return cmd.Run() == nil
 }

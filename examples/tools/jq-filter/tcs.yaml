@@ -1,0 +1,30 @@
+name: jq-filter
+summary: |
+  Runs a jq filter over a JSON document. jq knows nothing about the desk:
+  it takes argv flags and writes text. tcs-shim adapts it, so there is no
+  per-tool Go/Python/JS glue to write or maintain — just shim.yaml.
+
+  The wrapped binary gets no special treatment: same bwrap sandbox, same
+  network:false, same out/ audit, same per-job resource caps as a tool
+  written by hand.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [filter, document]
+  properties:
+    filter:   { type: string, minLength: 1 }
+    document: { type: object }
+
+output:
+  schema:
+    type: object
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 0
+  timeout_ms: 10000

@@ -20,6 +20,7 @@ type Tool struct {
 	Output             OutputSpec    `yaml:"output"`          // what agents get back
 	AllowedSideEffects SideEffects   `yaml:"allowed_side_effects"`
 	Sandbox            SandboxSpec   `yaml:"sandbox,omitempty"`
+	Integrity          IntegritySpec `yaml:"integrity,omitempty"`
 	Execution          ExecutionSpec `yaml:"execution"`
 
 	dir     string // on-disk location
@@ -27,10 +28,13 @@ type Tool struct {
 	raw     []byte // original tcs.yaml bytes (served at GET /tools/{name})
 }
 
+// OutputSpec declares the schema a tool's result must validate against.
 type OutputSpec struct {
 	Schema Schema `yaml:"schema,omitempty"`
 }
 
+// SideEffects declares the only ways a tool is allowed to touch the world
+// outside its input — everything else is what the sandbox exists to block.
 type SideEffects struct {
 	Files   []string `yaml:"files" json:"files"`     // empty = no file writes allowed
 	Network bool     `yaml:"network" json:"network"` // true = egress allowed
@@ -45,19 +49,34 @@ type SandboxSpec struct {
 	Out []string `yaml:"out" json:"out"` // files the tool may write (rw, tail-able)
 }
 
+// ExecutionSpec declares how a tool runs: queued through the worker pool
+// (default) or direct, and the retry/timeout budget either way.
 type ExecutionSpec struct {
 	Mode       string `yaml:"mode"` // "queued" (default) | "direct"
 	MaxRetries int    `yaml:"max_retries"`
 	TimeoutMS  int    `yaml:"timeout_ms"`
 }
 
+// IsQueued reports whether this tool goes through the worker queue rather
+// than running inline. An empty Mode defaults to queued.
 func (e ExecutionSpec) IsQueued() bool { return e.Mode == "" || e.Mode == "queued" }
 
+// Timeout returns the tool's execution timeout, defaulting to 30s when unset.
 func (e ExecutionSpec) Timeout() time.Duration {
 	if e.TimeoutMS <= 0 {
 		return 30 * time.Second
 	}
 	return time.Duration(e.TimeoutMS) * time.Millisecond
+}
+
+// MaxTotalDuration bounds how long the unified invoke path will ever wait
+// for a "direct" tool: one full timeout per attempt (the first run plus
+// every retry), plus slack for retry backoff. Not caller-tunable — direct
+// mode always waits for its own result, this just caps how long that can
+// possibly take before the desk gives up waiting and falls back to a job
+// id, same as a queued tool would.
+func (e ExecutionSpec) MaxTotalDuration() time.Duration {
+	return e.Timeout()*time.Duration(e.MaxRetries+1) + 5*time.Second
 }
 
 // LoadTools scans dir for tool folders. A folder is a tool iff it contains a
@@ -74,6 +93,18 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 		return nil, fmt.Errorf("abs %s: %w", dir, err)
 	}
 	entries, err := os.ReadDir(abs)
+	if os.IsNotExist(err) {
+		// A fresh install has no tools yet: someone who just unpacked a
+		// release and ran the binary should get a desk that starts and can
+		// be looked at, not a hard exit before it prints anything useful.
+		// The directory being unreadable (permissions, not a directory) is
+		// still an error — that one is a misconfiguration, not an empty
+		// starting point.
+		log.Printf("WARN: tools directory %s does not exist — no tools loaded; "+
+			"create it and drop a folder with a tcs.yaml in it, or start from "+
+			"an example: cp -r examples/tools/greet-python %s/", dir, dir)
+		return map[string]*Tool{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
@@ -104,6 +135,14 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 			continue
 		}
 		t.runPath = run
+		// A tool whose script no longer matches what was vetted does not
+		// load at all. Skipping it (rather than loading and failing every job)
+		// means the desk's tool list only ever advertises tools it can
+		// stand behind.
+		if err := verifyIntegrity(&t); err != nil {
+			log.Printf("ERROR: refusing to load tool %q: %v", name, err)
+			continue
+		}
 		if _, dup := tools[t.Name]; dup {
 			log.Printf("WARN: skipping tool folder %q: name %q already loaded from another folder", name, t.Name)
 			continue
@@ -113,13 +152,57 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 	return tools, nil
 }
 
+// AsJSON re-decodes the tool's raw tcs.yaml generically (not through the Tool
+// struct, so no field the struct doesn't know about is silently dropped) for
+// serving over the API. Authoring stays YAML (tcs.yaml on disk); everything
+// an agent reads or sends over the wire — this included — is JSON, no
+// exceptions to remember.
+func (t *Tool) AsJSON() (map[string]any, error) {
+	var generic map[string]any
+	if err := yaml.Unmarshal(t.raw, &generic); err != nil {
+		return nil, err
+	}
+	return generic, nil
+}
+
 func resolveRunScript(dir string) (string, error) {
 	for _, cand := range []string{"run.sh", "run.py", "run"} {
 		p := filepath.Join(dir, cand)
 		fi, err := os.Stat(p)
 		if err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			warnIfBypassable(p, fi)
 			return p, nil
 		}
 	}
 	return "", fmt.Errorf("no executable run script (run.sh/run.py/run) found")
+}
+
+// warnIfBypassable flags a tool's run script if anyone other than its
+// owner can execute it directly — group or other execute bits set. That's
+// the actual "can't skip the desk and run the tool by hand" guarantee: not
+// a particular harness's CLI extension intercepting a particular launch
+// pattern (useless the moment a different harness, or a plain shell, is
+// driving), but a permission the OS enforces for every process on the box,
+// desk included. Warn rather than refuse to load: a single-user dev
+// machine, where the operator's shell and the desk run as the same OS
+// account, is this project's primary use case, and file permissions can't
+// distinguish "the desk" from "the operator's shell" when they're the same
+// user by design — enforcing it is a deployment choice (a dedicated
+// service account owning tools/), not something the desk can force here.
+func warnIfBypassable(path string, fi os.FileInfo) {
+	// Read, not just execute, is enough to bypass a run.sh/run.py: `bash
+	// run.sh` or `python3 run.py` only needs to open and read the file,
+	// the interpreter is what actually executes. Checking execute bits
+	// alone (0o011) misses that — a 0644 script would pass silently while
+	// still being fully bypassable by anyone who can read it. 0o055 checks
+	// group/other read OR execute together.
+	if fi.Mode().Perm()&0o055 != 0 {
+		log.Printf("WARN: %s is readable or executable by group/other (mode %04o) — "+
+			"anyone on this box other than the script's owner can run it "+
+			"directly, or via its interpreter (read access alone is enough "+
+			"for a shell/python script), bypassing every contract check. If "+
+			"that matters for your deployment, chmod 700 it (or chown "+
+			"tools/ to a dedicated service account that only the desk runs as).",
+			path, fi.Mode().Perm())
+	}
 }

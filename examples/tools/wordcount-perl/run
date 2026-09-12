@@ -1,0 +1,34 @@
+#!/usr/bin/perl
+# Read one JSON document on stdin, write exactly one on stdout.
+# Nothing here imports or knows about the desk.
+#
+# /usr/bin/perl rather than /usr/bin/env perl on purpose: the system perl is
+# the one guaranteed to carry the core modules, and it is the copy that
+# exists on a stock install of any distribution.
+use strict;
+use warnings;
+
+# Core since Perl 5.14 and implemented in pure Perl — no compiled XS, so
+# there is no shared object to be missing on the target machine.
+use JSON::PP ();
+
+my $raw = do { local $/; <STDIN> };
+my $in  = JSON::PP->new->decode($raw);
+my $text = $in->{text};
+
+my @words = grep { length } split /\s+/, $text;
+
+# Match the obvious reading of "lines": the number of newline-separated
+# segments, so "a\nb" is 2 and a trailing newline yields a final empty one.
+my $lines = 0;
+if (length $text) {
+    my @segments = split /\n/, $text, -1;
+    $lines = scalar @segments;
+}
+
+# canonical keeps key order stable, which makes the output diffable.
+print JSON::PP->new->canonical->encode({
+    words => 0 + scalar @words,
+    chars => 0 + length $text,
+    lines => 0 + $lines,
+});

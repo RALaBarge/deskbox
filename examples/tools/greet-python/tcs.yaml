@@ -1,0 +1,31 @@
+name: greet-python
+summary: |
+  Greets someone by name. Exists to show a Python tool needs nothing but
+  the stdin-JSON-in / stdout-JSON-out convention — no SDK, no import, no
+  dependency on the desk at all.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [name]
+  properties:
+    name:    { type: string, minLength: 1 }
+    excited: { type: boolean }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [greeting, length]
+    properties:
+      greeting: { type: string }
+      length:   { type: integer }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 1
+  timeout_ms: 10000

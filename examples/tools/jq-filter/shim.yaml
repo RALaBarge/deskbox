@@ -1,0 +1,23 @@
+# How to map the contract's JSON onto a command that never heard of it.
+#
+# exec is an argv array, rendered from the input document and executed
+# directly — there is no shell, so a value can never inject a second
+# command no matter what it contains.
+exec:
+  - jq
+  - -c
+  # Everything after -- is data, so a filter that legitimately starts with
+  # "-" (jq's negative numbers) reaches jq as a filter, not as a flag.
+  - --
+  - "{{.filter}}"
+
+# jq wants the document on stdin. `json` is required here: interpolating
+# an object bare would render Go's map[k:v] syntax, not JSON.
+stdin: "{{json .document}}"
+
+success_exit_codes: [0]
+
+output:
+  # jq -c already emits one JSON document, so pass it straight through and
+  # let the desk validate it against tcs.yaml's output schema.
+  mode: json

@@ -9,7 +9,12 @@ import (
 
 // Schema is the subset of JSON Schema that TCS files may use.
 // Supported keywords: type, required, properties, additionalProperties,
-// items, minItems/maxItems, enum, minLength/maxLength, minimum/maximum.
+// items, minItems/maxItems, enum, minLength/maxLength, minimum/maximum,
+// oneOf/anyOf. Deliberately not supported: pattern, format, $ref, allOf,
+// const — pattern/format especially, on purpose: a regex validator in the
+// gate is complexity (escaping, ReDoS exposure) a tool's own runtime
+// already handles better downstream. oneOf/anyOf are structural (which
+// shape is this?), not content-level, so they stay in the gate.
 type Schema map[string]any
 
 // Validate returns a list of violations for value against schema.
@@ -21,7 +26,20 @@ func Validate(s Schema, v any) []string {
 	return validateValue(s, v, "$")
 }
 
+// validateValue checks v against s. oneOf/anyOf, when present, are the
+// entire check for this node — they don't compose with a sibling "type"
+// keyword. That's a deliberate simplification of full JSON Schema: the
+// real use case is "this field is either a string or a number", which is
+// naturally a oneOf of two type-only schemas, not a schema that mixes its
+// own type constraint with a oneOf branch list.
 func validateValue(s Schema, v any, path string) []string {
+	if raw, ok := s["oneOf"]; ok {
+		return validateOneOf(raw, v, path)
+	}
+	if raw, ok := s["anyOf"]; ok {
+		return validateAnyOf(raw, v, path)
+	}
+
 	var errs []string
 	typ, _ := s["type"].(string)
 
@@ -120,6 +138,51 @@ func validateValue(s Schema, v any, path string) []string {
 		}
 	}
 	return errs
+}
+
+// validateAnyOf requires v to satisfy at least one of the listed schemas.
+func validateAnyOf(raw any, v any, path string) []string {
+	branches, ok := raw.([]any)
+	if !ok || len(branches) == 0 {
+		return []string{fmt.Sprintf("%s: anyOf must be a non-empty list of schemas", path)}
+	}
+	for _, b := range branches {
+		bs, ok := asSchema(b)
+		if !ok {
+			continue
+		}
+		if len(validateValue(bs, v, path)) == 0 {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf("%s: value does not match any of the %d allowed shapes", path, len(branches))}
+}
+
+// validateOneOf requires v to satisfy exactly one of the listed schemas —
+// real JSON Schema oneOf semantics, not "at least one" (that's anyOf).
+func validateOneOf(raw any, v any, path string) []string {
+	branches, ok := raw.([]any)
+	if !ok || len(branches) == 0 {
+		return []string{fmt.Sprintf("%s: oneOf must be a non-empty list of schemas", path)}
+	}
+	matches := 0
+	for _, b := range branches {
+		bs, ok := asSchema(b)
+		if !ok {
+			continue
+		}
+		if len(validateValue(bs, v, path)) == 0 {
+			matches++
+		}
+	}
+	switch {
+	case matches == 0:
+		return []string{fmt.Sprintf("%s: value does not match any of the %d allowed shapes", path, len(branches))}
+	case matches > 1:
+		return []string{fmt.Sprintf("%s: value matches %d of the %d allowed shapes, oneOf requires exactly one", path, matches, len(branches))}
+	default:
+		return nil
+	}
 }
 
 func checkBounds(s Schema, path string, f float64) []string {

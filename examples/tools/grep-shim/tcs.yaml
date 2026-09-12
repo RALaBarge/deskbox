@@ -1,0 +1,34 @@
+name: grep-shim
+summary: |
+  Finds lines matching a pattern. A second shim example, covering what the
+  jq one doesn't: an optional flag, output that is plain text rather than
+  JSON, and a tool whose non-zero exit is a legitimate answer rather than
+  a failure (grep exits 1 for "no matches").
+
+input:
+  type: object
+  additionalProperties: false
+  required: [pattern, text]
+  properties:
+    pattern:     { type: string, minLength: 1 }
+    text:        { type: string }
+    ignore_case: { type: boolean }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [matches]
+    properties:
+      matches:
+        type: array
+        items: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 0
+  timeout_ms: 10000
