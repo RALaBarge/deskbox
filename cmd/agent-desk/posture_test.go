@@ -85,7 +85,7 @@ func TestEnforcementReportsPosture(t *testing.T) {
 // to break a test to remove one.
 func TestSandboxArgsHardening(t *testing.T) {
 	tool := &Tool{Name: "t"}
-	args, err := sandboxArgs("/usr/bin/bwrap", tool, t.TempDir(), t.TempDir(), t.TempDir())
+	args, err := sandboxArgs("/usr/bin/bwrap", tool, t.TempDir(), t.TempDir(), t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +96,7 @@ func TestSandboxArgsHardening(t *testing.T) {
 		"--unshare-ipc",     // no shared memory with the host
 		"--new-session",     // no controlling terminal: blocks TIOCSTI injection
 		"--die-with-parent", // no orphan surviving the desk
+		"--clearenv",        // the tool's env is exactly what --setenv bakes in, nothing inherited
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("bakeSandbox dropped %s:\n%s", want, joined)

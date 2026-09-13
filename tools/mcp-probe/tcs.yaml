@@ -1,0 +1,42 @@
+name: mcp-probe
+summary: |
+  Spawns a stdio MCP server, performs initialize + tools/list, and
+  returns the raw JSON-RPC response lines. Ported from ormcp's
+  mcp_probe.py, stdlib only (subprocess + threading).
+
+  `command` must be a system-installed executable (e.g. python3) — the
+  sandbox only exposes /usr /bin /sbin /lib /lib64. To probe a server
+  script that isn't itself under /usr, base64-encode it as
+  `script_base64` with a `script_name`; the tool writes it to
+  /deskbox/out (always writable, unlike /deskbox/in — see zip-inspect's
+  summary for why inline content is used instead of a file attachment)
+  and appends its path to `args` automatically.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [command]
+  properties:
+    command:      { type: string, minLength: 1, description: "executable, e.g. python3" }
+    args:         { type: array, items: { type: string }, default: [] }
+    script_base64: { type: string, description: "optional: a server script to run, base64-encoded" }
+    script_name:   { type: string, description: "required if script_base64 is set" }
+    timeout_sec:  { type: integer, minimum: 1, maximum: 120, default: 15 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [initialize_response, tools_list_response]
+    properties:
+      initialize_response: { type: string }
+      tools_list_response: { type: string }
+
+allowed_side_effects:
+  files: [/deskbox/out]
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 0
+  timeout_ms: 130000

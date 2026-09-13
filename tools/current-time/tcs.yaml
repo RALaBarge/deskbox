@@ -1,0 +1,34 @@
+name: current-time
+summary: |
+  Current date/time, optionally converted to a named timezone via a static
+  UTC-offset table (no zoneinfo/pytz dependency — DST-approximate, fine for
+  conversational use, not precise scheduling). Ported from ormcp's
+  datetime_tool.py, stdlib only.
+
+input:
+  type: object
+  additionalProperties: false
+  properties:
+    timezone: { type: string, description: "e.g. UTC, JST, 'new york', empty for local" }
+    local_utc_offset_hours: { type: number, default: -5 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [utc_iso, unix_timestamp]
+    properties:
+      utc_iso:          { type: string }
+      unix_timestamp:   { type: integer }
+      requested_tz:     { type: string }
+      requested_tz_iso: { type: string }
+      requested_tz_utc_offset: { type: number }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 2000

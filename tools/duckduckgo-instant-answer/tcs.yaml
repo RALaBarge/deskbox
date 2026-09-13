@@ -1,0 +1,38 @@
+name: duckduckgo-instant-answer
+summary: |
+  DuckDuckGo's official Instant Answer JSON API (api.duckduckgo.com) —
+  no key, documented for exactly this kind of programmatic use. Returns
+  an abstract/infobox-style answer plus related topics, not a ranked
+  list of web results. A different backend endpoint from
+  duckduckgo-search, so it stays up independently if that one is
+  rate-limited or its HTML markup changes.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [query]
+  properties:
+    query: { type: string, minLength: 1 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [heading, abstract, abstract_url, abstract_source, related_topics]
+    properties:
+      heading:         { type: string }
+      abstract:        { type: string }
+      abstract_url:    { type: string }
+      abstract_source: { type: string }
+      related_topics:
+        type: array
+        items: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: direct
+  max_retries: 1
+  timeout_ms: 10000

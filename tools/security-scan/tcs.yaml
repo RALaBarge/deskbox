@@ -1,0 +1,40 @@
+name: security-scan
+summary: |
+  Scans a project for hardcoded secrets, vulnerable dependencies
+  (auto-detects pnpm/npm/pip/poetry), dangerous code patterns
+  (eval/exec/SQL concat/command injection), unsafe GitHub Actions
+  workflows, and risky Dockerfile/compose/env configs. Ported verbatim
+  from ormcp's security_scan.py (514 lines, 100% stdlib already — no
+  rewrite needed) as a bundled library module the tool imports; only
+  run.py's stdin/stdout wrapper is new. Defensive use only: point it at
+  your own project.
+
+  The project is submitted as an inline base64 zip (`project_zip_base64`)
+  rather than an attached file — there is no working file-attachment
+  mechanism currently (see zip-inspect's summary for why). It's unzipped
+  into /deskbox/out/project (always writable) and scanned from there.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [action, project_zip_base64]
+  properties:
+    action:             { type: string, enum: [secrets, dependencies, patterns, workflows, configs, full] }
+    project_zip_base64: { type: string, minLength: 1 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [report]
+    properties:
+      report: { type: string }
+
+allowed_side_effects:
+  files: [/deskbox/out]
+  network: false
+
+execution:
+  mode: queued
+  max_retries: 0
+  timeout_ms: 60000

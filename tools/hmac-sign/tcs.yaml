@@ -1,0 +1,33 @@
+name: hmac-sign
+summary: |
+  HMAC-signs a message with a given key (hex digest). Useful for webhook
+  signature generation/verification. Stdlib only (hmac + hashlib). Fills
+  a gap the ported hash-string tool doesn't cover (plain hashing has no
+  key).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [message, key]
+  properties:
+    message:   { type: string }
+    key:       { type: string }
+    algorithm: { type: string, enum: [sha256, sha1, sha512], default: sha256 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [algorithm, hex_digest]
+    properties:
+      algorithm:  { type: string }
+      hex_digest: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 2000

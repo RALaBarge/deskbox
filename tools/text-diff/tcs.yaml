@@ -1,0 +1,29 @@
+name: text-diff
+summary: Unified diff between two texts. Ported from ormcp's util.py. Stdlib only (difflib).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [text_a, text_b]
+  properties:
+    text_a:  { type: string }
+    text_b:  { type: string }
+    context: { type: integer, minimum: 0, default: 3 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [diff, has_differences]
+    properties:
+      diff:            { type: string }
+      has_differences: { type: boolean }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 5000

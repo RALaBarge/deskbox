@@ -1,0 +1,46 @@
+name: zip-inspect
+summary: |
+  Lists a zip archive's contents (name, size, compressed size, is_dir)
+  without extracting anything. Stdlib only (zipfile, working entirely
+  in-memory via BytesIO). Takes the archive as inline base64 rather than
+  an attached file: `sandbox.in` currently only materializes a copy of
+  the job's own input JSON at each declared path (confirmed by reading
+  executor.go directly, then reproducing it live) — there is no actual
+  file-upload mechanism yet, contrary to what the aspirational examples
+  in docs/example-tool-ideas.md show. Fine for small-to-medium archives;
+  base64 in a JSON body isn't the right shape for anything huge.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [zip_base64]
+  properties:
+    zip_base64: { type: string, minLength: 1 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [entry_count, entries]
+    properties:
+      entry_count: { type: integer }
+      entries:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [name, size, compressed_size, is_dir]
+          properties:
+            name:             { type: string }
+            size:             { type: integer }
+            compressed_size:  { type: integer }
+            is_dir:           { type: boolean }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 10000

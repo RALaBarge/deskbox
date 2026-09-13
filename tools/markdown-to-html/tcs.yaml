@@ -1,0 +1,32 @@
+name: markdown-to-html
+summary: |
+  Converts Markdown to HTML. A small hand-rolled subset (headers, bold,
+  italic, inline code, fenced code blocks, links, unordered/ordered
+  lists, blockquotes, horizontal rules, paragraphs) — not a full
+  CommonMark implementation. No markdown package is available anywhere
+  under /usr on this system, and none is pip-installed either, so this
+  trades completeness for staying stdlib-only inside the sandbox.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [markdown]
+  properties:
+    markdown: { type: string }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [html]
+    properties:
+      html: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 5000

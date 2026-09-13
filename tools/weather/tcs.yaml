@@ -1,0 +1,30 @@
+name: weather
+summary: |
+  Current weather (or 3-day forecast) for a location via wttr.in. No API
+  key. Ported from ormcp's weather.py, stdlib-only rewrite (urllib
+  instead of httpx).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [location]
+  properties:
+    location: { type: string, minLength: 1 }
+    forecast: { type: boolean, default: false }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [report]
+    properties:
+      report: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: direct
+  max_retries: 1
+  timeout_ms: 12000

@@ -1,0 +1,31 @@
+name: yaml-json-convert
+summary: |
+  Converts between YAML and JSON text. Uses PyYAML from the system
+  package (/usr/lib*/python3*/site-packages/yaml) — installed as an OS
+  package, not pip, so it's visible inside the bwrap sandbox (which binds
+  /usr) unlike a pip-installed dependency would be.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [mode, text]
+  properties:
+    mode: { type: string, enum: [yaml_to_json, json_to_yaml] }
+    text: { type: string }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result]
+    properties:
+      result: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 5000

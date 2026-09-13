@@ -1,0 +1,27 @@
+name: base64-codec
+summary: Encodes or decodes a base64 string. Ported from ormcp's util.py. Stdlib only (base64).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [mode, text]
+  properties:
+    mode: { type: string, enum: [encode, decode] }
+    text: { type: string }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result]
+    properties:
+      result: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 2000

@@ -1,0 +1,41 @@
+name: wikipedia-search
+summary: |
+  Full-text search over Wikipedia via its official public MediaWiki API
+  (en.wikipedia.org/w/api.php, action=query&list=search) — no key. Not
+  general web search, but a genuinely independent third data source from
+  the two DuckDuckGo tools, useful as a fallback when both are
+  unreachable and the query is encyclopedic in nature.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [query]
+  properties:
+    query: { type: string, minLength: 1 }
+    limit: { type: integer, minimum: 1, maximum: 20, default: 5 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [results]
+    properties:
+      results:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [title, snippet, url]
+          properties:
+            title:   { type: string }
+            snippet: { type: string }
+            url:     { type: string }
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: direct
+  max_retries: 1
+  timeout_ms: 10000

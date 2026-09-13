@@ -1,0 +1,31 @@
+name: csv-tool
+summary: |
+  Parses CSV text to an array of row objects, or a JSON array of objects
+  back to CSV text. Optional column subset on the to-CSV direction.
+  Stdlib only (csv module).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [mode, text]
+  properties:
+    mode:    { type: string, enum: [to_json, from_json] }
+    text:    { type: string, description: "CSV text (to_json) or a JSON array of objects (from_json)" }
+    columns: { type: array, items: { type: string }, description: "from_json only: column order/subset" }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result]
+    properties:
+      result: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 5000

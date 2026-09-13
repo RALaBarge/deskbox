@@ -1,0 +1,32 @@
+name: unit-convert
+summary: |
+  Converts a value between units of the same kind: temperature (C/F/K),
+  bytes (B/KB/MB/GB/TB and KiB/MiB/GiB/TiB), distance, weight, time.
+  Ported from ormcp's util.py convert(). Stdlib only.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [value, from_unit, to_unit]
+  properties:
+    value:     { type: number }
+    from_unit: { type: string }
+    to_unit:   { type: string }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result, to_unit]
+    properties:
+      result:  { type: number }
+      to_unit: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 1000

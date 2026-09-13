@@ -85,12 +85,12 @@ func (b *cappedBuffer) String() string { return b.buf.String() }
 // The host filesystem (home dirs, ~/.ssh, /var, /etc service secrets) is NOT
 // mounted at all — no `--ro-bind / /`. Environment is fully controlled in
 // cmd.Env (no OPENROUTER_API_KEY or other host env leaks into the sandbox).
-func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
+func bakeSandbox(tool *Tool, inDir, outDir, toolDir string, toolEnv []string) ([]string, error) {
 	bw, err := exec.LookPath("bwrap")
 	if err != nil {
 		return nil, err
 	}
-	return sandboxArgs(bw, tool, inDir, outDir, toolDir)
+	return sandboxArgs(bw, tool, inDir, outDir, toolDir, toolEnv)
 }
 
 // sandboxArgs builds the argv given an already-resolved bwrap path. It is
@@ -98,7 +98,7 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
 // on a machine that doesn't have bubblewrap installed — otherwise the test
 // that a flag like --new-session is still present skips exactly where it
 // is most likely to be quietly dropped.
-func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string) ([]string, error) {
+func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string, toolEnv []string) ([]string, error) {
 	dstOut := "/deskbox/out"
 	args := []string{
 		bw, // absolute path — Go must exec this directly, no PATH lookup
@@ -112,12 +112,38 @@ func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string) ([]string
 		// pipes rather than a tty, so nothing here needs a terminal and
 		// this costs nothing.
 		"--new-session",
+		// The env the tool actually gets is enforced HERE, not by keeping
+		// cmd.Env minimal: --clearenv + explicit --setenv per var means
+		// whatever the desk process itself needs on its own env (e.g.
+		// XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS so `systemd-run --user
+		// --scope` can reach the session bus to apply resource limits —
+		// see wrapWithResourceLimits) can never reach the tool by accident,
+		// no matter what cmd.Env holds for the outer systemd-run/bwrap
+		// process. This is a hard boundary at the sandbox layer instead of
+		// a discipline-only one at the Go call site.
+		"--clearenv",
+	}
+	for _, kv := range toolEnv {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			args = append(args, "--setenv", k, v)
+		}
 	}
 
 	// System read-only base: toolchain + a bare minimum of /etc.
 	// /bin /sbin /lib /lib64 are toplevel symlinks to usr/ on Fedora; the ELF
 	// interpreter resolves through /lib64/ld-linux*, so they MUST be bound or
 	// execvp fails with ENOENT inside the fresh root.
+	//
+	// /usr/local deliberately isn't in this list even though sandboxPath
+	// includes /usr/local/bin: it's a real, separate tree on plain Fedora
+	// but a symlink to /var/usrlocal on ostree/atomic variants (Bazzite),
+	// and bwrap refuses to `--ro-bind` onto a symlink whose target isn't
+	// already inside a path this sandbox has bound ("Can't mount on symlink
+	// destination") — there's no single bind rule that's both correct and
+	// portable across both layouts. A shimmed tool that needs tcs-shim (or
+	// any other host-installed helper outside /usr) should vendor its own
+	// copy under its tool folder and invoke it via $DESKBOX_TOOL_DIR, which
+	// is always bound — see tools/jq-filter for that pattern in practice.
 	base := []struct{ src, dst string }{
 		{"/usr", "/usr"},
 		{"/bin", "/bin"},
@@ -265,8 +291,12 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 	errBuf := &cappedBuffer{max: maxToolStderr}
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
-	// Fully-controlled env: nothing from the host shell leaks into the sandbox.
-	cmd.Env = []string{
+	// This is what the TOOL sees. When bwrap is available, sandboxArgs bakes
+	// this exact list in via --clearenv + --setenv (see there for why); this
+	// var is passed in as toolEnv below. When it isn't (unsandboxed fallback,
+	// a couple branches down), this is also literally cmd.Env, since nothing
+	// else enforces the boundary in that path.
+	toolEnv := []string{
 		"PATH=" + sandboxPath,
 		"HOME=/tmp",
 		"LANG=C.UTF-8",
@@ -275,10 +305,11 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		"DESKBOX_TOOL=" + tool.Name,
 		fmt.Sprintf("DESKBOX_ATTEMPT=%d", job.Attempt),
 	}
+	cmd.Env = toolEnv
 
 	toolDir := filepath.Dir(tool.runPath)
 	scoped := false
-	if args, err := bakeSandbox(tool, inDir, outDir, toolDir); err == nil {
+	if args, err := bakeSandbox(tool, inDir, outDir, toolDir, append(toolEnv, "DESKBOX_TOOL_DIR=/deskbox/tool")); err == nil {
 		script := filepath.Join("/deskbox/tool", filepath.Base(tool.runPath))
 		args = append(args, script)
 		wrapped := wrapWithResourceLimits(args, d.settings, d.resourceLimitsOK.Load())
@@ -300,8 +331,14 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		}
 		cmd.Path = wrapped[0]
 		cmd.Args = wrapped
-		// Inside the sandbox the tool's own folder is always bound here.
-		cmd.Env = append(cmd.Env, "DESKBOX_TOOL_DIR=/deskbox/tool")
+		// bwrap's own --clearenv (baked into `args` above) is now what
+		// isolates the tool, so the outer process — systemd-run when
+		// scoped, bwrap itself otherwise — is free to inherit the desk's
+		// real environment. It needs to: `systemd-run --user --scope`
+		// has to find XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS somewhere
+		// to reach the user session bus at all, and that's real desk-process
+		// env, not something worth hand-threading through as a one-off.
+		cmd.Env = os.Environ()
 	} else if errors.Is(err, ErrContract) {
 		// The contract itself is malformed (a sandbox.in path escaping the
 		// workspace). That is the tool author's bug in either mode — running

@@ -1,0 +1,45 @@
+name: network-audit
+summary: |
+  Local network discovery, TCP port scanning, service fingerprinting, and
+  CVE lookup against your own LAN. Ported verbatim from ormcp's
+  network_audit.py (1488 lines, 100% stdlib already — ipaddress, socket,
+  ssl, subprocess; no rewrite needed) as a bundled library module; only
+  run.py's stdin/stdout wrapper is new. Defensive use only: point it at
+  networks/hosts you own or are authorized to test.
+
+  No root in the sandbox, so this is TCP-connect scanning and
+  /proc/net/arp cache reads only (no raw-socket SYN scan) — the original
+  tool's stated non-root code path.
+
+  Commands: get_status (privilege + interfaces), scan_network (subnet
+  sweep + port scan), scan_device (single host), fingerprint_service
+  (banner grab on one port), check_vulnerabilities (CVE lookup by
+  service name/version, no network needed for this one).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [command]
+  properties:
+    command: { type: string, enum: [get_status, scan_network, scan_device, fingerprint_service, check_vulnerabilities] }
+    subnet:  { type: string, description: "scan_network, e.g. 192.168.1.0/24" }
+    ip:      { type: string, description: "scan_device / fingerprint_service" }
+    port:    { type: integer, description: "fingerprint_service" }
+    protocol: { type: string, default: tcp }
+    ports:   { type: string, default: "top-1000" }
+    timeout: { type: number, default: 1.0 }
+    service: { type: string, description: "check_vulnerabilities" }
+    version: { type: string, description: "check_vulnerabilities" }
+
+output:
+  schema:
+    type: object
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: queued
+  max_retries: 0
+  timeout_ms: 120000

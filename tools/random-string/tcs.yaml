@@ -1,0 +1,28 @@
+name: random-string
+summary: |
+  Cryptographically random string generator (secrets module, not random).
+  Ported from ormcp's util.py.
+
+input:
+  type: object
+  additionalProperties: false
+  properties:
+    length:  { type: integer, minimum: 1, maximum: 4096, default: 16 }
+    charset: { type: string, enum: [alphanumeric, hex, digits, readable, ascii], default: alphanumeric }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result]
+    properties:
+      result: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 1000

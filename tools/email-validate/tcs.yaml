@@ -1,0 +1,33 @@
+name: email-validate
+summary: |
+  Validates email address syntax (simplified RFC 5322) and flags common
+  domain typos (gmai.com, yahooo.com, etc). No network access — no DNS/MX
+  lookup, since that needs a resolver beyond stdlib's getaddrinfo. Stdlib
+  only (re).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [email]
+  properties:
+    email: { type: string, minLength: 3, maxLength: 254 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [valid, format_correct, has_common_typo, suggestion]
+    properties:
+      valid:           { type: boolean }
+      format_correct:  { type: boolean }
+      has_common_typo: { type: boolean }
+      suggestion:      { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 1000

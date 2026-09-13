@@ -1,0 +1,28 @@
+name: hash-string
+summary: Hashes a string with sha256/sha1/md5/sha512. Ported from ormcp's util.py. Stdlib only (hashlib).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [text]
+  properties:
+    text:      { type: string }
+    algorithm: { type: string, enum: [sha256, sha1, md5, sha512], default: sha256 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [algorithm, hex_digest]
+    properties:
+      algorithm:  { type: string }
+      hex_digest: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 2000

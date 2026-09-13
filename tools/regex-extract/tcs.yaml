@@ -1,0 +1,42 @@
+name: regex-extract
+summary: |
+  Extracts all matches (and named/numbered groups) of a regex pattern from
+  text. Complements the grep-shim example, which is line-based; this
+  returns structured group data across the whole text. Stdlib only (re).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [pattern, text]
+  properties:
+    pattern:     { type: string, minLength: 1 }
+    text:        { type: string }
+    ignore_case: { type: boolean }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [match_count, matches]
+    properties:
+      match_count: { type: integer }
+      matches:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [full_match, groups]
+          properties:
+            full_match: { type: string }
+            groups:
+              type: array
+              items: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 5000

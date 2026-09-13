@@ -1,0 +1,30 @@
+name: calculator
+summary: |
+  Evaluates a math expression (+, -, *, /, //, %, ** and parentheses) using
+  an AST whitelist — no eval(), no code execution beyond arithmetic. Ported
+  from ormcp's calculator.py, stdlib only (ast + operator).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [expression]
+  properties:
+    expression: { type: string, minLength: 1 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [result]
+    properties:
+      result:  { type: number }
+      display: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 2000

@@ -1,0 +1,32 @@
+name: system-info
+summary: |
+  Host stats snapshot (CPU, RAM, disk, GPU, uptime) via an allowlist of
+  read-only system commands (cat, ps, df, free, uptime, nproc,
+  nvidia-smi, ...) — shell metacharacters are rejected outright. Ported
+  from ormcp's system_info.py, dropping its optional Ollama/httpx probe
+  (that hit a host-specific embed backend not meaningful inside the
+  sandbox). Runs against the sandbox's own view of the host (/proc,
+  /usr, /bin only — not the real host filesystem).
+
+input:
+  type: object
+  additionalProperties: false
+  properties:
+    command: { type: string, description: "single allowlisted command, e.g. 'df -h /'; empty = full snapshot" }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [output]
+    properties:
+      output: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 8000

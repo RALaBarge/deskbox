@@ -1,0 +1,42 @@
+name: duckduckgo-search
+summary: |
+  Full web search results via DuckDuckGo's public HTML endpoint
+  (html.duckduckgo.com/html/). No API key. Ported from ormcp's
+  web_search.py — stdlib-only rewrite (urllib + html.parser instead of
+  httpx). One of three independent no-auth search tools (see also
+  duckduckgo-instant-answer and wikipedia-search) kept as fallbacks for
+  each other.
+
+input:
+  type: object
+  additionalProperties: false
+  required: [query]
+  properties:
+    query:       { type: string, minLength: 1 }
+    max_results: { type: integer, minimum: 1, maximum: 25, default: 5 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [results]
+    properties:
+      results:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [title, url, snippet]
+          properties:
+            title:   { type: string }
+            url:     { type: string }
+            snippet: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: direct
+  max_retries: 1
+  timeout_ms: 15000

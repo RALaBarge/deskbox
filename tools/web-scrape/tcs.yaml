@@ -1,0 +1,33 @@
+name: web-scrape
+summary: |
+  Fetches a URL and extracts clean text (strips script/style/nav/footer,
+  turns block tags into line breaks). Ported from ormcp's web_scraper.py,
+  stdlib-only rewrite (urllib instead of httpx). Rejects loopback/private/
+  link-local targets with a hand-rolled SSRF guard in place of ormcp's
+  security.safe_url (not importable in the sandbox).
+
+input:
+  type: object
+  additionalProperties: false
+  required: [url]
+  properties:
+    url:               { type: string, minLength: 1 }
+    max_content_length: { type: integer, minimum: 100, maximum: 200000, default: 10000 }
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [text, truncated]
+    properties:
+      text:      { type: string }
+      truncated: { type: boolean }
+
+allowed_side_effects:
+  files: []
+  network: true
+
+execution:
+  mode: direct
+  max_retries: 1
+  timeout_ms: 17000

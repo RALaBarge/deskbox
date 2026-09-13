@@ -1,0 +1,24 @@
+name: uuid-generate
+summary: Generates a random UUID4. Ported from ormcp's util.py. Stdlib only (uuid).
+
+input:
+  type: object
+  additionalProperties: false
+  properties: {}
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [uuid]
+    properties:
+      uuid: { type: string }
+
+allowed_side_effects:
+  files: []
+  network: false
+
+execution:
+  mode: direct
+  max_retries: 0
+  timeout_ms: 1000
