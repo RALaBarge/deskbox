@@ -58,6 +58,27 @@ would behave identically piped to by hand — which is the whole design. Write
 your own the same way in any language, drop the folder in `tools/`, and it
 is a contract-enforced endpoint.
 
+## Real-world patterns (why this matters)
+
+The core design — contract enforcement + durable job store + resource isolation — solves real problems:
+
+**Idempotency eliminates race conditions.** Pass `idempotency_key` in the request. If the same key arrives twice (network hiccup, agent retry, concurrent agents), the tool runs once and all callers get the same result. No double-charges, no duplicate shipments, no special logic in the tool itself.
+
+```bash
+curl -X POST localhost:8080/tools/charge-card \
+  -d '{"input":{...},"idempotency_key":"user-order-12345"}'
+# First call: tool runs, returns result
+# Any later call with the same key: returns SAME result, tool doesn't re-run
+```
+
+**Durability survives crashes.** Every job is persisted. Desk crashes mid-execution? Restart it, and every queued or running job automatically re-enqueues — zero orphans, zero lost work. Query the full history anytime with `GET /jobs/{id}` to audit what happened.
+
+**Isolation prevents cascading failures.** Each tool runs in its own sandbox with memory and process-count caps. One runaway tool can't starve others. Combined with `-workers` concurrency limiting, you get fair queuing: agents fire requests as fast as they want, the desk runs them safely 10 at a time (or however many you configure).
+
+**Exactly-once semantics for distributed systems.** Consumer from a job queue calls the desk with the job's id as the idempotency key. If the consumer crashes, the next consumer re-submits with the same key and gets the same result. No distributed transaction, no consensus protocol — just "run this once if you haven't already."
+
+This is the pattern that works for: agentic workflows needing retry/resume, microservices calling untrusted plugins, concurrent batch processing, and any system where "I'm not sure if this ran" is unacceptable. See [USE-CASES.md](USE-CASES.md) for detailed scenarios.
+
 ## Layout
 
 ```
