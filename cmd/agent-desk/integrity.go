@@ -52,20 +52,11 @@ func (i IntegritySpec) runPinned() bool    { return strings.TrimSpace(i.RunSHA25
 func (i IntegritySpec) interpPinned() bool { return strings.TrimSpace(i.InterpreterSHA256) != "" }
 
 // resolveInterpreter returns the interpreter a tool's run script will actually
-// be executed by, resolved the same way a job will find it: the shebang's
-// program, looked up against sandboxPath. A compiled binary (no shebang) has
-// no interpreter dependency — that's the whole argument for vendoring one — so
-// this reports (”", "", false) and interpreter pinning does not apply.
+// be executed by, resolved the same way a job will find it and the same way
+// tcs-verify checks it: shared in internal/tcs so the daemon and the offline
+// linter can't resolve it differently.
 func resolveInterpreter(runPath string) (name, path string, ok bool) {
-	interp, ok := shebangInterpreter(runPath)
-	if !ok {
-		return "", "", false
-	}
-	p, err := lookPathIn(interp, sandboxPath)
-	if err != nil {
-		return interp, "", false
-	}
-	return interp, p, true
+	return tcs.ResolveInterpreter(runPath, sandboxPath)
 }
 
 // verifyIntegrity checks a tool's run script, and the interpreter that runs

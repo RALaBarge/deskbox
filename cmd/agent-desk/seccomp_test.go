@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"deskbox/agent-desk/internal/tcs"
 )
 
 // TestSeccompProgramWellFormed: the assembled filter must be non-empty and a
@@ -43,7 +45,7 @@ func TestSeccompDeniesPtrace(t *testing.T) {
 	if !probeSeccomp(prog, &Settings{}, false) {
 		t.Skip("seccomp does not apply on this kernel/host (probe failed) — see known.md")
 	}
-	if _, err := lookPathIn("python3", sandboxPath); err != nil {
+	if _, err := tcs.LookPathIn("python3", sandboxPath); err != nil {
 		t.Skip("python3 not on the sandbox PATH: no in-sandbox agent to call ptrace")
 	}
 

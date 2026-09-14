@@ -52,7 +52,7 @@ func firstTool(t *testing.T, tools map[string]*Tool, err error) *Tool {
 // normal Linux, but the test says so rather than asserting it).
 func shHash(t *testing.T) string {
 	t.Helper()
-	path, err := lookPathIn("/bin/sh", sandboxPath)
+	path, err := tcs.LookPathIn("/bin/sh", sandboxPath)
 	if err != nil {
 		t.Skipf("/bin/sh not resolvable on sandbox PATH: %v", err)
 	}

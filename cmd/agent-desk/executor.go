@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"deskbox/agent-desk/internal/tcs"
 )
 
 // ErrContract marks a failure caused by violating the Tool Contract Spec
@@ -41,9 +43,9 @@ const (
 	// deliberately the system PATH and nothing else: whatever was on the
 	// operator's PATH when they started the desk must not change what a
 	// tool can find, or the same contract resolves differently depending
-	// on who launched the desk. Preflight resolves against this same value
-	// so its answer is the one the job will actually get.
-	sandboxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	// on who launched the desk. It is defined once in internal/tcs so the
+	// executor, preflight, and tcs-verify all resolve against the same value.
+	sandboxPath = tcs.SandboxPath
 )
 
 // cappedBuffer accumulates up to max bytes, then drops the rest while still

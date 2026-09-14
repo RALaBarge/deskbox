@@ -185,7 +185,7 @@ func lintRunScript(dir string, c contract) []finding {
 		return out
 	}
 
-	// Integrity pin, if present, must match the file on disk now.
+	// Run-script pin, if present, must match the file on disk now.
 	if pin := strings.ToLower(strings.TrimSpace(c.Integrity.RunSHA256)); pin != "" {
 		sum, err := tcs.HashFile(runPath)
 		if err != nil {
@@ -195,7 +195,38 @@ func lintRunScript(dir string, c contract) []finding {
 				"integrity.run_sha256 does not match the run script on disk\n       pinned:  %s\n       on disk: %s", pin, sum)})
 		}
 	}
+
+	// Interpreter pin, if present, must match the interpreter the shebang
+	// resolves to on the sandbox PATH — resolved via the same shared code the
+	// desk uses, so the linter and the runtime check agree. This is the stale
+	// pin (a package upgrade moved the interpreter) tcs-verify exists to catch
+	// in CI before deploy.
+	if pin := strings.ToLower(strings.TrimSpace(c.Integrity.InterpreterSHA256)); pin != "" {
+		name, ipath, ok := tcs.ResolveInterpreter(runPath, tcs.SandboxPath)
+		switch {
+		case !ok:
+			out = append(out, finding{msg: fmt.Sprintf(
+				"integrity.interpreter_sha256 is set but the interpreter (%s) could not be resolved "+
+					"on the sandbox PATH to hash", orNone(name))})
+		default:
+			sum, err := tcs.HashFile(ipath)
+			if err != nil {
+				out = append(out, finding{msg: fmt.Sprintf("cannot hash interpreter %s to check its pin: %v", ipath, err)})
+			} else if sum != pin {
+				out = append(out, finding{msg: fmt.Sprintf(
+					"integrity.interpreter_sha256 does not match %s (%s) on disk — often a package upgrade; re-pin with agent-desk -pin\n       pinned:  %s\n       on disk: %s",
+					name, ipath, pin, sum)})
+			}
+		}
+	}
 	return out
+}
+
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "none — no shebang"
+	}
+	return s
 }
 
 // trimDollar rewrites the leading "$" the schema linter uses for the document

@@ -457,7 +457,12 @@ Not covered, by design or by limit:
   syscall not on the denylist is allowed — the filter shrinks the blast
   radius of a sandbox escape, it does not enumerate a minimal permitted set.
   That is the deliberate trade for working across every language runtime
-  without killing tools on a syscall someone forgot to allow.
+  without killing tools on a syscall someone forgot to allow. One notable
+  call left allowed is `unshare`/`clone(CLONE_NEWUSER)`: a compromised tool
+  can still nest its own user namespace (it can't escalate host privilege,
+  but it is the same "widens the blast radius" category) — blocking it
+  wholesale would break legitimate tools that sandbox themselves, so it
+  stays allowed by choice.
 - **`network: true` is all-or-nothing, and no egress filter ships.** A tool
   that declares egress gets a real network namespace with DNS and the TLS
   trust store bound, and can reach **any** host — there is no per-destination
