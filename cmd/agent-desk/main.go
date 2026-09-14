@@ -22,7 +22,7 @@ import (
 //
 //	go build -ldflags "-X main.version=v0.2.0 -X main.commit=$(git rev-parse --short HEAD)"
 var (
-	version = "0.1.0"
+	version = "1.0.0"
 	commit  = ""
 )
 
@@ -58,6 +58,13 @@ type Desk struct {
 	// sandboxOK: bubblewrap was present at startup. Fixed for the process
 	// lifetime — unlike resource limits, bwrap doesn't stop existing.
 	sandboxOK bool
+	// seccompOK: the syscall filter was assembled and proven to apply on this
+	// box at startup (probeSeccomp). Fixed for the process lifetime like
+	// sandboxOK — the kernel doesn't stop supporting seccomp mid-run.
+	// seccompProg holds the assembled program handed to bwrap per job; it is
+	// only ever read after startup, so no lock is needed.
+	seccompOK   bool
+	seccompProg []byte
 	// resourceLimitsOK: systemd-run --user --scope confirmed working at
 	// startup. Can flip false at runtime if a job discovers it stopped
 	// working (see the "Failed to connect to bus" handling in Execute) —
@@ -85,11 +92,21 @@ func NewDesk(tools map[string]*Tool, q *Queue, dataDir string, settings *Setting
 func (d *Desk) enforcement() map[string]any {
 	sandbox := d.sandboxOK
 	limits := d.resourceLimitsOK.Load()
+	seccomp := d.seccompOK
 
 	warnings := []string{}
 	if !sandbox {
 		warnings = append(warnings, "bubblewrap not found: tools run unsandboxed, and network:false "+
 			"is advisory only rather than enforced by the kernel")
+	}
+	// Seccomp only means anything when there is a sandbox to install it on. On
+	// a box without bwrap the bwrap warning already says everything, so a
+	// second line about the filter would just be noise; the missing filter is
+	// only its own degradation when the sandbox is otherwise present.
+	if sandbox && !seccomp {
+		warnings = append(warnings, "seccomp filter not applied: a tool can make any syscall its uid "+
+			"is allowed to (ptrace, kernel modules, mount, reboot) — namespaces still limit what it "+
+			"can reach, not what it can ask for")
 	}
 	if !limits {
 		warnings = append(warnings, "systemd-run --user --scope not usable: per-job memory and "+
@@ -121,6 +138,7 @@ func (d *Desk) enforcement() map[string]any {
 	return map[string]any{
 		"strict":          d.settings.Strict,
 		"sandbox":         sandbox,
+		"seccomp":         seccomp,
 		"resource_limits": limits,
 		"auth":            d.settings.AuthEnabled,
 		"listen":          d.settings.ListenAddr,
@@ -131,7 +149,7 @@ func (d *Desk) enforcement() map[string]any {
 		// do — reported alongside the mechanisms because it bounds them.
 		"user":     describeUser(),
 		"root":     root,
-		"degraded": !sandbox || !limits || root,
+		"degraded": !sandbox || !limits || root || (sandbox && !seccomp),
 		"warnings": warnings,
 	}
 }
@@ -295,6 +313,28 @@ func main() {
 		log.Printf("preflight: all %d declared tool dependencies present and reachable inside the sandbox", len(deps))
 	}
 
+	// Seccomp: assemble the syscall denylist and prove it applies on this box
+	// before trusting it. Only meaningful with a sandbox to install it on —
+	// without bwrap there is nothing to attach a filter to, so it stays off
+	// and the bwrap warning already covers the gap.
+	var seccompOK bool
+	var seccompProg []byte
+	if sandboxOK {
+		prog, err := buildSeccompProgram()
+		if err != nil {
+			log.Printf("WARN: seccomp filter could not be built (%v) — tools can make any syscall "+
+				"their uid allows; namespaces still limit what they can reach, not what they ask for", err)
+		} else if probeSeccomp(prog, settings, resourceLimitsOK) {
+			seccompProg = prog
+			seccompOK = true
+			log.Printf("seccomp: syscall denylist active — blocked calls (ptrace, kernel modules, " +
+				"mount, reboot, …) return EPERM inside the sandbox")
+		} else {
+			log.Printf("WARN: seccomp filter did not apply on this box (kernel rejected it, or the " +
+				"fd did not survive the sandbox wrapping) — tools run without the syscall filter")
+		}
+	}
+
 	// Every degradation above fails open: loudly logged, but open. -strict
 	// turns them into a refusal, for a deployment where "the sandbox wasn't
 	// available so we ran the tool anyway" is not an acceptable outcome.
@@ -302,6 +342,9 @@ func main() {
 		var missing []string
 		if !sandboxOK {
 			missing = append(missing, "bubblewrap (the sandbox itself)")
+		}
+		if sandboxOK && !seccompOK {
+			missing = append(missing, "seccomp (the syscall filter could not be assembled or applied)")
 		}
 		if !resourceLimitsOK {
 			missing = append(missing, "systemd-run --user --scope (per-job memory and task caps)")
@@ -368,6 +411,12 @@ func main() {
 	defer q.Stop()
 
 	d := NewDesk(tools, q, *dataDir, settings, sandboxOK, resourceLimitsOK)
+	// Seccomp state is set on the struct rather than threaded through NewDesk:
+	// it is startup-fixed like sandboxOK, read-only after this point, and
+	// keeping it off the constructor avoids churning every NewDesk caller
+	// (including tests) for a field they don't exercise.
+	d.seccompOK = seccompOK
+	d.seccompProg = seccompProg
 
 	if n, err := q.Resume(); err != nil {
 		log.Printf("resume from store: %v", err)

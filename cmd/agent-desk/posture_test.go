@@ -60,6 +60,7 @@ func TestEnforcementReportsPosture(t *testing.T) {
 	d := NewDesk(nil, NewQueue(1, nil), t.TempDir(),
 		&Settings{AuthEnabled: true}, true, true)
 	d.sandboxOK = true
+	d.seccompOK = true // every mechanism present: seccomp is one of them now
 	e := d.enforcement()
 
 	if _, ok := e["user"].(string); !ok {

@@ -138,6 +138,7 @@ func TestEnforcementStatus(t *testing.T) {
 
 	d = strictDesk(t, t.TempDir(), false, true)
 	d.sandboxOK = true
+	d.seccompOK = true // seccomp is a mechanism too; "every mechanism present" now includes it
 	d.settings.AuthEnabled = true
 	e = d.enforcement()
 	// Running as root is itself a downgrade — the mechanisms are all

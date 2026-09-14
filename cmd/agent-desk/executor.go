@@ -163,7 +163,18 @@ func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string, toolEnv [
 	}
 
 	if tool.AllowedSideEffects.Network {
-		// egress allowed: bind DNS + TLS trust so curl/git actually work
+		// network is all-or-nothing, by design and on purpose. `network: true`
+		// binds DNS + the TLS trust store and drops --unshare-net, so the tool
+		// gets a real network namespace and can reach ANY host: there is no
+		// per-destination allowlist here, and HTTP(S)_PROXY is not set. The
+		// desk deliberately ships no egress filter — enforcing "which hosts"
+		// robustly means a filtering layer of its own (a proxy the tool can't
+		// route around, or nftables in the job's netns), which is the
+		// operator's to add for a deployment that needs it. If you need to
+		// bound where a tool can talk, do it OUTSIDE the desk (a locked-down
+		// netns, an egress firewall, an authenticated proxy the box forces
+		// all traffic through); the contract's boolean only says whether the
+		// tool gets the network at all, never which parts of it.
 		for _, p := range []string{"/etc/resolv.conf", "/etc/ssl", "/etc/pki", "/etc/crypto-policies", "/run/systemd/resolve"} {
 			if _, err := os.Lstat(p); err == nil {
 				args = append(args, "--ro-bind", p, p)
@@ -310,6 +321,26 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 	toolDir := filepath.Dir(tool.runPath)
 	scoped := false
 	if args, err := bakeSandbox(tool, inDir, outDir, toolDir, append(toolEnv, "DESKBOX_TOOL_DIR=/deskbox/tool")); err == nil {
+		// Seccomp: hand bwrap the assembled syscall filter on an inherited fd.
+		// seccompOK is a startup fact (the filter was proven to apply on this
+		// box), so the only failure here is the rare local one of not being
+		// able to open a pipe. Under -strict that is a refusal, not a silent
+		// unfiltered run — same posture as every other enforcement mechanism.
+		if d.seccompOK && len(d.seccompProg) > 0 {
+			f, perr := seccompPipe(d.seccompProg)
+			if perr != nil {
+				if d.settings.Strict {
+					return nil, fmt.Errorf("%w: could not set up the seccomp filter (%v), and "+
+						"-strict refuses to run a job without it", ErrEnforcement, perr)
+				}
+				log.Printf("WARN: seccomp filter setup failed for job %s (%v); this job runs "+
+					"without the syscall filter (advisory only)", job.ID, perr)
+			} else {
+				defer f.Close()
+				cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+				args = withSeccompFlag(args, 2+len(cmd.ExtraFiles)) // first inherited fd is 3
+			}
+		}
 		script := filepath.Join("/deskbox/tool", filepath.Base(tool.runPath))
 		args = append(args, script)
 		wrapped := wrapWithResourceLimits(args, d.settings, d.resourceLimitsOK.Load())

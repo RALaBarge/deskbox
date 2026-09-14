@@ -19,10 +19,11 @@ DIST ?= dist
 
 all: build
 
-## build: both binaries for this machine
+## build: all three binaries for this machine
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/agent-desk ./cmd/agent-desk
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/tcs-shim ./cmd/tcs-shim
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/tcs-verify ./cmd/tcs-verify
 
 ## test: vet + the race detector, which is what the concurrency tests need
 test:
@@ -41,6 +42,7 @@ install: build
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 0755 $(BIN)/agent-desk $(DESTDIR)$(PREFIX)/bin/agent-desk
 	install -m 0755 $(BIN)/tcs-shim $(DESTDIR)$(PREFIX)/bin/tcs-shim
+	install -m 0755 $(BIN)/tcs-verify $(DESTDIR)$(PREFIX)/bin/tcs-verify
 
 ## dist: release tarballs, one per platform, plus checksums
 dist: clean
@@ -54,6 +56,8 @@ dist: clean
 	    -o $$stage/agent-desk ./cmd/agent-desk || exit 1; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags "$(LDFLAGS)" \
 	    -o $$stage/tcs-shim ./cmd/tcs-shim || exit 1; \
+	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags "$(LDFLAGS)" \
+	    -o $$stage/tcs-verify ./cmd/tcs-verify || exit 1; \
 	  cp README.md LICENSE.md known.md $$stage/; \
 	  cp -r examples $$stage/; \
 	  tar -C $(DIST) -czf $$stage.tar.gz $$(basename $$stage); \

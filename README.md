@@ -18,8 +18,8 @@ work.
 ## Quickstart
 
 ```bash
-tar -xzf deskbox-v0.1.0-linux-amd64.tar.gz
-cd deskbox-v0.1.0-linux-amd64
+tar -xzf deskbox-v1.0.0-linux-amd64.tar.gz
+cd deskbox-v1.0.0-linux-amd64
 
 mkdir -p tools && cp -r examples/tools/greet-python tools/
 ./agent-desk -check          # does this box have what that tool needs?
@@ -73,7 +73,7 @@ deskbox/
 │   │   ├── store_sqlite.go  # default backend: one file, no server
 │   │   └── store_postgres.go # optional: shared job state across desk instances
 │   ├── tcs-shim/            # generic adapter for CLIs that never heard of the desk
-│   └── tcs-verify/          # (stub) Rust CLI for offline spec checking
+│   └── tcs-verify/          # offline TCS linter (Go; shares internal/tcs)
 ├── examples/tools/          # four sample tools; copy into tools/ to use
 └── tools/                   # the space agents read, each tool owns a folder:
     └── <name>/              #   tcs.yaml (contract), run.sh (implementation),
@@ -326,6 +326,7 @@ curl -X POST localhost:8080/tools/example-tool -d '{"input": {}}'
 | Input matches `input` schema | validator at submit | N/A, rejected at HTTP 400 |
 | No forbidden file writes | `out/` audit post-run | yes |
 | No network egress when `network:false` | bubblewrap `--unshare-net` | structural |
+| No dangerous syscalls (ptrace, kernel modules, mount, reboot, …) | seccomp-BPF denylist via bwrap `--seccomp` | structural (blocked → EPERM) |
 | Output is one JSON doc | stdout parse or `out/` file | yes |
 | Output matches `output` schema | validator | yes |
 | Transient tool failure | queue retry w/ exponential backoff | retried up to `max_retries` |
@@ -379,6 +380,7 @@ never has to infer it from the logs:
   "enforcement": {
     "strict": false,
     "sandbox": false,
+    "seccomp": false,
     "resource_limits": false,
     "auth": false,
     "listen": "127.0.0.1:8080",
@@ -418,6 +420,19 @@ Kernel-enforced, per job, nothing to trust:
 - no surviving orphan if the desk dies (`--die-with-parent`, plus
   `Pdeathsig` for the case where the desk is killed hard)
 - memory and process-count caps per job, where `systemd-run --user` works
+- **a seccomp-BPF syscall filter**, so the sandbox limits not only what a
+  tool can *reach* but what it can *ask the kernel for*. The desk assembles a
+  denylist — ptrace and process injection, `bpf`, kernel modules, the
+  keyring, mounting, swap, `reboot`/`kexec`, clock and hostname changes — and
+  hands it to bwrap via `--seccomp`; a blocked call returns `EPERM`, not a
+  `SIGSYS` kill, so a tool that merely probes for a capability sees a normal
+  "not permitted". It is a denylist rather than an allowlist on purpose: an
+  allowlist across every language runtime a tool might use is unmaintainable
+  and fails closed on the first missed syscall, killing legitimate tools. The
+  program is assembled pure-Go (no libseccomp, no cgo — the static-binary
+  story is intact) and proven to apply on the box once at startup; `GET /`
+  reports `seccomp: true/false`, and `-strict` refuses to start if a sandbox
+  is present but the filter can't be installed.
 
 Not covered, by design or by limit:
 
@@ -428,13 +443,30 @@ Not covered, by design or by limit:
   limits which paths exist, but everything inside is reached as uid 0, and
   files the tool leaves in `out/` are root-owned. The desk now says so
   loudly at startup, reports it in `GET /`, and refuses to start under
-  `-strict`.
-- **Syscalls are not filtered.** There is no seccomp profile; a tool can
-  make any syscall its uid is allowed to make. Namespaces limit what it can
-  *reach*, not what it can *ask for*.
-- **`network: true` is all-or-nothing.** A tool that declares egress gets
-  DNS and TLS roots bound and can talk to anything. There is no per-host
-  allowlist.
+  `-strict`. **Per-job uid isolation is a deliberate non-goal.** Giving each
+  job its own throwaway uid (so a tool isn't even the desk's own user) needs
+  subordinate-uid ranges and a setuid-root `newuidmap`, i.e. privileged
+  per-host setup — which fights the whole static-binary, no-privileged-deps
+  design for a narrow gain over "run the desk as a dedicated unprivileged
+  account", which already scopes what any tool can touch to that account.
+  bwrap's own `--unshare-user` alone would remap uids only *inside* the
+  namespace while files still land as the real host uid, so it would be
+  security theater; the desk does not pretend to offer it.
+- **The syscall filter is a denylist, not an allowlist.** The named
+  dangerous calls are blocked (see the kernel-enforced list above), but a
+  syscall not on the denylist is allowed — the filter shrinks the blast
+  radius of a sandbox escape, it does not enumerate a minimal permitted set.
+  That is the deliberate trade for working across every language runtime
+  without killing tools on a syscall someone forgot to allow.
+- **`network: true` is all-or-nothing, and no egress filter ships.** A tool
+  that declares egress gets a real network namespace with DNS and the TLS
+  trust store bound, and can reach **any** host — there is no per-destination
+  allowlist and `HTTP(S)_PROXY` is not set. Enforcing *which* hosts a tool
+  may reach means a filtering layer the tool can't route around (an
+  authenticated proxy, or nftables in the job's netns), and that is
+  deliberately the operator's to add for a deployment that needs it: the
+  contract's boolean says whether the tool gets the network at all, never
+  which parts of it. Bound egress **outside** the desk.
 - **A contract is a promise about shape, not intent.** The desk enforces
   that a tool takes and returns what it says, writes only what it declared,
   and reaches only what it asked for. It cannot tell you the tool does
@@ -442,9 +474,15 @@ Not covered, by design or by limit:
   is the whole reason `tools/` ships empty.
 - **The desk itself is not sandboxed.** It is an ordinary process that
   binds a port and runs programs. Which is why it defaults to loopback.
-- **What a tool pulls in from `/usr` is not pinned.** The script's own
-  contents can be (see below), but the interpreter and libraries it loads
-  are whatever your package manager last installed.
+- **The interpreter can be pinned; the libraries it loads cannot.** The run
+  script's contents pin with `run_sha256`, and the interpreter the shebang
+  names (python3, /bin/sh, …) pins with `interpreter_sha256` (see below) —
+  both checked at load and per job. What is still not pinned is everything
+  that interpreter then pulls in from `/usr` at runtime: shared libraries,
+  site-packages, whatever your package manager last installed. Full
+  content-addressed `/usr` (binding a pinned rootfs instead of the host's)
+  would close that but throw away "runs on any Linux with the host's
+  runtimes", so the desk pins the two ends it can and says so.
 
 ### Integrity: making "I vetted this tool" outlast the moment you vetted it
 
@@ -461,7 +499,20 @@ that got in. Pin the hash and vetting stops being a memory:
 # tcs.yaml
 integrity:
   run_sha256: "fcf7a0581e5fbf3a7cf46c6dd0d65116ae58fc89a5d81b434104cde89bbc6550"
+  interpreter_sha256: "379c1bfc53d08815975c647ad7da5d19d8e8a8566ce8097c50231c8b116e5e7b"
 ```
+
+`interpreter_sha256` extends the same idea to what actually *runs* the
+script. A run.sh you vetted is executed by whatever `/bin/sh` (or python3, …)
+its shebang names and the sandbox PATH resolves — a file you didn't write and
+didn't hash. Pinning it hashes that interpreter at load and per job, the same
+two places as the script. It is opt-in and separate from `run_sha256` for a
+reason: unlike the script, the interpreter is not author-controlled, so a
+routine `dnf upgrade python3` changes it and the pin goes stale *by design* —
+that is the check doing its job, telling you "the thing that runs your tool
+changed, re-vet it". `-pin` reprints the current value to paste after such an
+upgrade; a compiled binary vendored as `run` has no interpreter and simply
+skips this. Both pins are also checked offline by `tcs-verify` (below).
 
 Checked in two places, because either alone has a hole. At **load**, a tool
 that doesn't match doesn't load at all — it never appears in `GET /tools`,
@@ -577,8 +628,8 @@ desk's own code. Running a released binary needs no toolchain at all, which
 is the point: `tar -xzf`, then run it.
 
 ```bash
-tar -xzf deskbox-v0.1.0-linux-amd64.tar.gz
-cd deskbox-v0.1.0-linux-amd64
+tar -xzf deskbox-v1.0.0-linux-amd64.tar.gz
+cd deskbox-v1.0.0-linux-amd64
 ./agent-desk -version
 ./agent-desk -check                            # before you trust it with work
 ./agent-desk                                   # 127.0.0.1:8080; -workers 10, -tools ./tools
@@ -640,6 +691,27 @@ The same report is served as JSON at `GET /preflight`, so an agent that just
 got a confusing tool failure — or an operator without shell access to the
 box — can ask the running desk what it is missing. The desk also logs any
 problems at startup rather than waiting for the first job to hit them.
+
+### `tcs-verify`: lint a contract offline, before it ever ships
+
+`-check` asks a running desk about *this box*; `tcs-verify` asks about *the
+contract itself*, with nothing running and nothing executed — so it drops into
+CI or a pre-commit hook where there is no desk and no tools installed.
+
+```bash
+tcs-verify tools/greet-python              # a tool folder (reads its tcs.yaml)
+tcs-verify tools/*                          # or several at once
+```
+
+For each contract it checks that the YAML parses, that the input/output
+schemas use only the supported subset (flagging a `pattern`/`$ref`/`allOf`
+the gate would silently ignore, a `maxLenght` typo, a malformed `oneOf`), that
+a run script exists, is executable, and isn't readable/executable by
+group/other (the same bypass the desk warns about at load), and that any
+integrity pin matches what's on disk now. It exits non-zero if any contract
+has an error. Crucially it validates against the **same** schema package the
+desk enforces with (`internal/tcs`), so a contract `tcs-verify` passes is
+exactly one the desk will honor — the linter and the gate cannot drift apart.
 
 ### Running it as a service
 
@@ -828,11 +900,27 @@ through the interface.
 - [x] Shippable on any Linux: static CGO-free binaries for amd64/arm64 via
       `make dist`, `-check` to tell an operator up front which runtimes a
       box is missing or has installed where the sandbox can't see them
-- [x] Tool integrity pinning: `integrity.run_sha256` in `tcs.yaml`, verified
-      at load and again per job, so "I vetted this" survives the moment it
-      was vetted; `-pin` prints the block, never writes it
-- [ ] `tcs-verify` Rust CLI (offline spec linting), stub only
+- [x] Tool integrity pinning: `integrity.run_sha256` **and
+      `integrity.interpreter_sha256`** in `tcs.yaml`, verified at load and
+      again per job, so "I vetted this" — the script *and* the interpreter
+      that runs it — survives the moment it was vetted; `-pin` prints the
+      block, never writes it
+- [x] Seccomp-BPF syscall denylist installed on every job via bwrap
+      `--seccomp` (ptrace, kernel modules, mount, reboot, keyring, … → EPERM);
+      assembled pure-Go (no cgo), proven to apply at startup, reported in
+      `GET /`, and required under `-strict`
+- [x] `tcs-verify`: offline TCS linter (Go, not the old Rust stub) sharing
+      the desk's own `internal/tcs` validator, so the linter and the gate
+      cannot drift — schema-subset checks, run-script permission/bypass
+      checks, and integrity-pin verification with no desk running
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
+
+Deliberate non-goals (documented under "What the sandbox does and does not
+cover" rather than left as gaps to close): per-job uid isolation (needs
+privileged subuid/`newuidmap` setup — run the desk as a dedicated
+unprivileged account instead), a per-host network egress allowlist
+(`network` stays all-or-nothing; bound egress outside the desk), and
+content-addressed pinning of everything under `/usr`.
 
 ## License
 

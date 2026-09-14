@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"deskbox/agent-desk/internal/tcs"
 )
 
 // pinnedTool writes a working tool, optionally with an integrity pin
@@ -22,7 +24,7 @@ func pinnedTool(t *testing.T, pin bool) (map[string]*Tool, string, string) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho '{\"ok\":true}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	tcs := `
+	spec := `
 name: echo
 input: {type: object}
 output: {schema: {type: object}}
@@ -30,13 +32,13 @@ allowed_side_effects: {files: [], network: false}
 execution: {mode: queued, max_retries: 0, timeout_ms: 5000}
 `
 	if pin {
-		sum, err := hashFile(script)
+		sum, err := tcs.HashFile(script)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tcs += "integrity:\n  run_sha256: \"" + sum + "\"\n"
+		spec += "integrity:\n  run_sha256: \"" + sum + "\"\n"
 	}
-	writeFile(t, filepath.Join(toolDir, "tcs.yaml"), tcs)
+	writeFile(t, filepath.Join(toolDir, "tcs.yaml"), spec)
 
 	tools, err := LoadTools(filepath.Join(dir, "tools"))
 	if err != nil {
