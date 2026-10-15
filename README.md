@@ -950,5 +950,4 @@ content-addressed pinning of everything under `/usr`.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for any noncommercial
-purpose. Commercial use needs a separate license from the author.
+[MIT](LICENSE).

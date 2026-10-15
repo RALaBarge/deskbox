@@ -141,4 +141,4 @@ Query progress anytime with `GET /batches/{id}`.
 
 ### License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for any noncommercial purpose. Commercial use needs a license from the author.
+[MIT](LICENSE).
