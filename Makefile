@@ -58,7 +58,7 @@ dist: clean
 	    -o $$stage/tcs-shim ./cmd/tcs-shim || exit 1; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags "$(LDFLAGS)" \
 	    -o $$stage/tcs-verify ./cmd/tcs-verify || exit 1; \
-	  cp README.md LICENSE.md known.md $$stage/; \
+	  cp README.md LICENSE known.md $$stage/; \
 	  cp -r examples $$stage/; \
 	  tar -C $(DIST) -czf $$stage.tar.gz $$(basename $$stage); \
 	  rm -rf $$stage; \
