@@ -208,9 +208,13 @@ func main() {
 	pin := flag.Bool("pin", false,
 		"print a paste-ready integrity block (SHA-256 of each tool's run script) and exit — "+
 			"read the script first; this only prints, it never edits tcs.yaml")
+	jobKey := flag.String("job-key", "",
+		"file holding a shared secret; every job then gets DESKBOX_JOB_TS and DESKBOX_JOB_MAC, an HMAC "+
+			"over its tool, id, attempt and time that a receiver with the same key (the sbx-broker) can verify")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	settings.Strict = *strict
+	settings.JobKeyFile = *jobKey
 	settings.ListenAddr = *addr
 
 	if *showVersion {

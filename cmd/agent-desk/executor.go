@@ -342,6 +342,17 @@ func (d *Desk) Execute(parent context.Context, tool *Tool, job *Job, input map[s
 		"DESKBOX_TOOL=" + tool.Name,
 		fmt.Sprintf("DESKBOX_ATTEMPT=%d", job.Attempt),
 	}
+	// With -job-key the desk vouches for the job: a token over (tool, job id,
+	// attempt, time) that the job can present but not forge for another tool.
+	// A key that cannot be read fails the job rather than running it without
+	// the token its receiver will demand.
+	if d.settings.JobKeyFile != "" {
+		tokenEnv, err := jobTokenEnv(d.settings.JobKeyFile, tool.Name, job.ID, job.Attempt, time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrEnforcement, err)
+		}
+		toolEnv = append(toolEnv, tokenEnv...)
+	}
 	cmd.Env = toolEnv
 
 	toolDir := filepath.Dir(tool.runPath)

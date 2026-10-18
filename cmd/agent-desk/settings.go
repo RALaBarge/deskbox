@@ -26,6 +26,11 @@ type Settings struct {
 	SQLitePath  string // empty = <data-dir>/deskbox.db
 	PostgresDSN string
 
+	// JobKeyFile, when set, makes the desk give every job a token (DESKBOX_JOB_TS
+	// and DESKBOX_JOB_MAC) that a receiver outside the sandbox holding the same
+	// key can verify. See jobtoken.go. Empty = no token, the default.
+	JobKeyFile string
+
 	// Per-job cgroup limits (via systemd-run --scope). bwrap's namespaces
 	// isolate what a tool can see; they don't cap what it can consume, so
 	// without these one runaway or malicious tool degrades the host for
