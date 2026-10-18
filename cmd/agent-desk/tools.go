@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"deskbox/agent-desk/internal/tcs"
 	"gopkg.in/yaml.v3"
 )
 
@@ -45,8 +46,9 @@ type SideEffects struct {
 // dir (writable, host-tailable). If empty, the desk materializes input.json
 // in in/ and accepts stdout as the result channel.
 type SandboxSpec struct {
-	In  []string `yaml:"in"  json:"in"`  // exact files the pull needs (ro)
-	Out []string `yaml:"out" json:"out"` // files the tool may write (rw, tail-able)
+	In   []string        `yaml:"in"  json:"in"`   // exact files the pull needs (ro)
+	Out  []string        `yaml:"out" json:"out"`  // files the tool may write (rw, tail-able)
+	Bind []tcs.BindMount `yaml:"bind,omitempty" json:"bind,omitempty"`
 }
 
 // ExecutionSpec declares how a tool runs: queued through the worker pool
@@ -135,6 +137,13 @@ func LoadTools(dir string) (map[string]*Tool, error) {
 			continue
 		}
 		t.runPath = run
+		// A bind the executor would refuse is a broken contract, and a tool
+		// that only fails at job time is worse than one that never appears:
+		// GET /tools should not advertise it either.
+		if err := tcs.ValidateBinds(t.Sandbox.Bind); err != nil {
+			log.Printf("ERROR: refusing to load tool %q: %v", name, err)
+			continue
+		}
 		// A tool whose script no longer matches what was vetted does not
 		// load at all. Skipping it (rather than loading and failing every job)
 		// means the desk's tool list only ever advertises tools it can

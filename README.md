@@ -146,6 +146,10 @@ sandbox:                   # the per-job workspace surface (bwrap layer)
                            #   even list siblings)
   out: [result.json]       # files the tool may write, host-tailable live
                            #   (tail -f the real path, or GET /jobs/<id>/out/<f>)
+  bind:                    # host paths mounted into the job, read-only unless
+                           #   `rw: true`; dst must be under /deskbox
+    - src: /run/sbx/broker.sock
+      dst: /deskbox/broker.sock
 
 execution:
   mode: queued             # queued (async, retried) | direct (sync)
@@ -169,6 +173,18 @@ properties:
       - { type: integer }
       - { type: string, enum: ["unspecified"] }
 ```
+
+`sandbox.bind` is how a tool reaches something that is not a data file. The
+case it exists for is a control socket: a tool that has to call a service on
+the host, which would otherwise need `network: true` and with it the whole
+network namespace. A bind mounts that one path, read-only by default, and
+leaves the network shut. `dst` must be under `/deskbox`, so a contract cannot
+bind over `/usr` or `/etc` — the sandbox base is shared by every tool and one
+contract must not be able to change what the others run on. A source that is
+missing when the job starts fails the job with the path named, rather than
+leaving bwrap's mount error to explain it. The same rule is checked by
+`tcs-verify` offline (both share `internal/tcs`), so a contract cannot pass
+the linter and then be refused by the gate.
 
 ## Tool conventions (the files in the space)
 
@@ -939,6 +955,9 @@ through the interface.
       the desk's own `internal/tcs` validator, so the linter and the gate
       cannot drift — schema-subset checks, run-script permission/bypass
       checks, and integrity-pin verification with no desk running
+- [x] `sandbox.bind`: mount one declared host path into the job, read-only
+      unless `rw: true`, destination pinned under `/deskbox` — the way a tool
+      with `network: false` still reaches a control socket
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 
 Deliberate non-goals (documented under "What the sandbox does and does not

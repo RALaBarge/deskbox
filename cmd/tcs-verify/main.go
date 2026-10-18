@@ -37,6 +37,9 @@ type contract struct {
 	Output struct {
 		Schema tcs.Schema `yaml:"schema"`
 	} `yaml:"output"`
+	Sandbox struct {
+		Bind []tcs.BindMount `yaml:"bind"`
+	} `yaml:"sandbox"`
 	Integrity struct {
 		RunSHA256         string `yaml:"run_sha256"`
 		InterpreterSHA256 string `yaml:"interpreter_sha256"`
@@ -143,6 +146,13 @@ func lintFile(path string) []finding {
 	}
 	for _, e := range tcs.Lint(c.Output.Schema) {
 		out = append(out, finding{msg: "output.schema" + trimDollar(e)})
+	}
+
+	// sandbox.bind: the same rule the desk enforces at load and at run, so a
+	// contract cannot pass the linter and then be refused by the gate. The
+	// check lives in internal/tcs for exactly this reason.
+	if err := tcs.ValidateBinds(c.Sandbox.Bind); err != nil {
+		out = append(out, finding{msg: err.Error()})
 	}
 
 	// The run script: present, executable, and not bypassable by other

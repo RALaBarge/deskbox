@@ -92,6 +92,15 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string, toolEnv []string) ([
 	if err != nil {
 		return nil, err
 	}
+	// Declared binds are the tool's only route to something outside its own
+	// workspace, so a missing source is a deployment fault rather than a tool
+	// failure: name the path here instead of leaving bwrap's mount error to
+	// explain it.
+	for _, b := range tool.Sandbox.Bind {
+		if _, err := os.Lstat(b.Src); err != nil {
+			return nil, fmt.Errorf("%w: sandbox.bind src %q: %v", ErrContract, b.Src, err)
+		}
+	}
 	return sandboxArgs(bw, tool, inDir, outDir, toolDir, toolEnv)
 }
 
@@ -101,6 +110,9 @@ func bakeSandbox(tool *Tool, inDir, outDir, toolDir string, toolEnv []string) ([
 // that a flag like --new-session is still present skips exactly where it
 // is most likely to be quietly dropped.
 func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string, toolEnv []string) ([]string, error) {
+	if err := tcs.ValidateBinds(tool.Sandbox.Bind); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrContract, err)
+	}
 	dstOut := "/deskbox/out"
 	args := []string{
 		bw, // absolute path — Go must exec this directly, no PATH lookup
@@ -203,6 +215,18 @@ func sandboxArgs(bw string, tool *Tool, inDir, outDir, toolDir string, toolEnv [
 	}
 	args = append(args, "--bind", outDir, dstOut)
 	args = append(args, "--ro-bind", toolDir, "/deskbox/tool")
+
+	// Declared host paths, after the work surface so /deskbox already exists
+	// as a mount point. Read-only unless the contract asked for rw, and
+	// validated above to live under /deskbox — a bind is a path the contract
+	// named, never a widening of what else is mounted.
+	for _, b := range tool.Sandbox.Bind {
+		flag := "--ro-bind"
+		if b.RW {
+			flag = "--bind"
+		}
+		args = append(args, flag, b.Src, b.Dst)
+	}
 
 	args = append(args, "--chdir", "/deskbox")
 	return args, nil
