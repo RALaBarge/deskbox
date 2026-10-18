@@ -30,6 +30,25 @@ type BindMount struct {
 // able to do.
 const BindDstRoot = "/deskbox"
 
+// reservedDst are the destinations the desk mounts itself, in executor.go,
+// before any declared bind: the input files, the output directory and the tool
+// directory (which holds the very script the integrity pin hashed). Declared
+// binds are emitted after those mounts, and a later mount wins, so a bind onto
+// /deskbox/tool, or onto a file below it, would replace the pinned script
+// with one the pin never saw. A bind onto /deskbox itself would hide all
+// three. None of them may be a destination, and neither may anything below
+// them.
+var reservedDst = []string{BindDstRoot, BindDstRoot + "/tool", BindDstRoot + "/in", BindDstRoot + "/out"}
+
+func reserved(dst string) (string, bool) {
+	for _, r := range reservedDst {
+		if dst == r || (r != BindDstRoot && strings.HasPrefix(dst, r+"/")) {
+			return r, true
+		}
+	}
+	return "", false
+}
+
 // ValidateBinds rejects the declarations an executor cannot honor. It uses
 // path rather than filepath: these are Linux paths inside a Linux sandbox,
 // and the rule has to be the one the kernel will see, not the one the machine
@@ -45,6 +64,9 @@ func ValidateBinds(binds []BindMount) error {
 		}
 		if b.Dst != BindDstRoot && !strings.HasPrefix(b.Dst, BindDstRoot+"/") {
 			return fmt.Errorf("sandbox.bind[%d]: dst %q must live under %s", i, b.Dst, BindDstRoot)
+		}
+		if r, bad := reserved(b.Dst); bad {
+			return fmt.Errorf("sandbox.bind[%d]: dst %q is %s or below it, which the desk mounts itself; bind elsewhere under %s", i, b.Dst, r, BindDstRoot)
 		}
 		if seen[b.Dst] {
 			return fmt.Errorf("sandbox.bind[%d]: another bind already targets %q", i, b.Dst)

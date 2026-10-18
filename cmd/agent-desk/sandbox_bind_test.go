@@ -54,7 +54,12 @@ func TestSandboxBindRejectsEscapeDst(t *testing.T) {
 		"/usr/bin/python3",
 		"/deskboxx/not-under", // a prefix that is not a path component
 		"/deskbox/../etc/passwd",
-		"deskbox/sock", // relative
+		"deskbox/sock",  // relative
+		"/deskbox",      // would hide the work surface
+		"/deskbox/tool", // would replace the directory the integrity pin hashed
+		"/deskbox/tool/run.py",
+		"/deskbox/in/input.json",
+		"/deskbox/out",
 	} {
 		tool := &Tool{Name: "t", Sandbox: SandboxSpec{Bind: []tcs.BindMount{{Src: "/run/sbx/broker.sock", Dst: dst}}}}
 		if _, err := sandboxArgs("/usr/bin/bwrap", tool, t.TempDir(), t.TempDir(), t.TempDir(), nil); err == nil {
