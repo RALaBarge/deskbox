@@ -60,9 +60,12 @@ is a contract-enforced endpoint.
 
 ## Real-world patterns
 
-The core design:  contract enforcement + durable job store + resource isolation
+The core design: contract enforcement + durable job store + resource isolation
 
-**Idempotency eliminates race conditions.**  If the same key arrives twice (network hiccup, agent retry, concurrent agents), the tool runs once and all callers get the same result. No double-charges, no duplicate shipments, no special logic in the tool itself.
+**Idempotency eliminates race conditions.** If the same key arrives twice
+(network hiccup, agent retry, concurrent agents), the tool runs once and all
+callers get the same result. No double-charges, no duplicate shipments, no
+special logic in the tool itself.
 
 ```bash
 curl -X POST localhost:8080/tools/charge-card \
@@ -71,13 +74,23 @@ curl -X POST localhost:8080/tools/charge-card \
 # Any later call with the same key: returns SAME result, tool doesn't re-run
 ```
 
-**Durability survives crashes.** Every job is persisted. Every queued or running job automatically re-enqueues: zero orphans, zero lost work. Query the full history anytime with `GET /jobs/{id}` to audit what happened.
+**Durability survives crashes.** Every job is persisted. Every queued or
+running job automatically re-enqueues: zero orphans, zero lost work. Query the
+full history anytime with `GET /jobs/{id}` to audit what happened.
 
-**Isolation prevents cascading failures.** Each tool runs in its own sandbox with memory and process-count caps. Combined with `-workers` concurrency limiting.  Agents fire requests as fast as they want, the desk runs them safely 10 at a time, that number being editable.
+**Isolation prevents cascading failures.** Each tool runs in its own sandbox
+with memory and process-count caps. Combined with `-workers` concurrency
+limiting. Agents fire requests as fast as they want, the desk runs them safely
+10 at a time, that number being editable.
 
-**Exactly-once semantics for distributed systems.** Consumer from a job queue calls the desk with the job's id as the idempotency key. If the consumer crashes, the next consumer re-submits with the same key and gets the same result. Simple as just "run this once if you haven't already."
+**Exactly-once semantics for distributed systems.** Consumer from a job queue
+calls the desk with the job's id as the idempotency key. If the consumer
+crashes, the next consumer re-submits with the same key and gets the same
+result. Simple as just "run this once if you haven't already."
 
-This is the pattern that works for: agentic workflows needing retry/resume, microservices calling untrusted plugins, concurrent batch processing, and any system where "I'm not sure if this ran" is unacceptable. 
+This is the pattern that works for: agentic workflows needing retry/resume,
+microservices calling untrusted plugins, concurrent batch processing, and any
+system where "I'm not sure if this ran" is unacceptable.
 
 See [USE-CASES.md](USE-CASES.md) for detailed scenarios.
 
@@ -103,7 +116,7 @@ deskbox/
                               #   README.md (skill notes for agents)
 ```
 
-No tools ship in `tools/` —  Working samples live in
+No tools ship in `tools/` — Working samples live in
 [`examples/tools/`](examples/tools/) (Python, Perl, and two built on
 `tcs-shim` that wrap `jq` and `grep` with no glue code); copy what you want.
 They depend only on things a stock Linux install already has.
@@ -164,6 +177,7 @@ own language already handles better downstream. `oneOf`/`anyOf` are
 structural (which shape is this?) rather than content-level, so those stay
 in the gate; a schema using either is the entire check for that node — it
 doesn't compose with a sibling `type` keyword, e.g.:
+
 ```yaml
 properties:
   amount:
@@ -184,9 +198,11 @@ properties:
 
 Nothing in the desk itself stops someone from running `tools/<name>/run.sh`
 by hand instead of going through the API — that's not a gap a single HTTP
-server can close by watching for it,  a plain shell walks right past it if someone **./run.sh's** a tool directly. 
+server can close by watching for it: a plain shell walks right past it if
+someone **./run.sh's** a tool directly.
 
-What *does* close it is the same thing that keeps everything else off the tool's sandbox: OS file permissions. 
+What *does* close it is the same thing that keeps everything else off the
+tool's sandbox: OS file permissions.
 
 At load time the desk warns if a run script is executable by group or other:
 
@@ -198,13 +214,12 @@ bypassing every contract check. If that matters for your deployment, chmod
 runs as).
 ```
 
-On a single-user dev machine that warning
-is just informational; the guarantee doesn't really apply when "the
-operator's shell" and "the desk" are the same user by design. Where it
-matters (a shared box, an operator you don't fully trust), `chmod 700` the
-scripts or `chown` `tools/` to a dedicated account that only the desk
-process runs as, and the warning goes away because the permission itself
-now enforces it.
+On a single-user dev machine that warning is just informational; the
+guarantee doesn't really apply when "the operator's shell" and "the desk"
+are the same user by design. Where it matters (a shared box, an operator you
+don't fully trust), `chmod 700` the scripts or `chown` `tools/` to a dedicated
+account that only the desk process runs as, and the warning goes away because
+the permission itself now enforces it.
 
 ## API
 
@@ -246,9 +261,9 @@ violation, never retried), or `canceled` (an operator's `DELETE`).
 ### Waiting for a result instead of polling
 
 Every submission is persisted and queued the same way regardless of the
-tool's `execution.mode` : that setting only controls how long `POST`
+tool's `execution.mode`: that setting only controls how long `POST`
 blocks before responding, not whether the job gets retries, idempotency
-dedup, or a durable record. 
+dedup, or a durable record.
 
 Two ways to avoid a polling loop:
 
@@ -284,6 +299,7 @@ curl -X DELETE localhost:8080/jobs/job-abc123
 # 409 {"error":"job already done, nothing to cancel", ...} — already terminal
 # 404 — job doesn't exist
 ```
+
 A canceled job's process is actually killed (`SIGKILL` via the run's
 context being canceled), not just marked canceled while left running in
 the background — confirmed with no orphaned process left behind after a
@@ -291,9 +307,8 @@ mid-run cancel.
 
 ### The inbox: finding out something finished, without a claim/TTL protocol
 
-An always-on daemon, so
-there's no race to arbitrate. Multiple callers seeing the same un-acked job
-is harmless. The inbox is a plain query instead:
+An always-on daemon, so there's no race to arbitrate. Multiple callers
+seeing the same unacked job is harmless. The inbox is a plain query instead:
 
 ```bash
 curl localhost:8080/jobs                       # every terminal job not yet acked
@@ -301,7 +316,7 @@ curl 'localhost:8080/jobs/wait-any?timeout=30s' # long-poll: blocks until one ex
 curl -X POST localhost:8080/jobs/job-abc123/ack # done looking at it — clears the inbox
 ```
 
-Nothing is lost if nobody polls for a while. Un-acked rows just sit there,
+Nothing is lost if nobody polls for a while. Unacked rows just sit there,
 same durability guarantee the job store already gives every job. Acking an
 already-acked job is a no-op; acking one that hasn't finished yet is a
 `409`.
@@ -324,10 +339,8 @@ curl localhost:8080/batches/batch-abc123
 ```
 
 An invalid item anywhere fails the whole batch at the gate before any job
-is created — no partial fan-out with some items silently skipped. 
-
-There's
-no per-item lease to expire: there's one worker (the desk itself), and a
+is created — no partial fan-out with some items silently skipped. There's no
+per-item lease to expire: there's one worker (the desk itself), and a
 crashed/restarted desk resumes every unfinished item exactly the way it
 resumes any other in-flight job (confirmed: killed a desk mid-batch with
 one item running and two still queued, restarted against the same data
@@ -357,12 +370,11 @@ curl -X POST localhost:8080/tools/example-tool -d '{"input": {}}'
 
 ### Fail-open by default, `-strict` when that isn't acceptable
 
-Without
-`bwrap` there is no sandbox, so `network: false` degrades to advisory, and
-without a usable `systemd-run --user --scope` there are no per-job memory
-and task caps. By default the desk **fails open** — it logs the degradation
-loudly and keeps serving, because a desk that refuses to run on a host
-missing one optional package would be mega annoying.
+Without `bwrap` there is no sandbox, so `network: false` degrades to
+advisory, and without a usable `systemd-run --user --scope` there are no
+per-job memory and task caps. By default the desk **fails open** — it logs
+the degradation loudly and keeps serving, because a desk that refuses to run
+on a host missing one optional package would be mega annoying.
 
 Failing open is the wrong default for some deployments and the whole point
 is that enforcement is not a matter of trust, so `-strict` (or
@@ -379,22 +391,19 @@ is that enforcement is not a matter of trust, so `-strict` (or
 It holds at run time too, not only at startup. `systemd-run --user --scope`
 can pass the boot probe and stop working later — an SSH session going away,
 a container without full session infrastructure — and the desk's fail-open
-response is to disable the wrapper for the rest of its life. 
-
-Under `-strict`
+response is to disable the wrapper for the rest of its life. Under `-strict`
 that flag instead makes every subsequent job fail with
 `enforcement unavailable` rather than run uncapped. Those refusals are
 permanent, never retried: the missing mechanism is process-wide, so a second
 attempt would fail identically while burning the tool's retry budget.
 
 `-strict` also refuses two things that are postures rather than missing
-mechanisms: running as **root**
-(every job would get uid 0 inside its sandbox), and listening on a
-**routable address with auth off** (anyone who can reach the box could
-submit jobs).
+mechanisms: running as **root** (every job would get uid 0 inside its
+sandbox), and listening on a **routable address with auth off** (anyone who
+can reach the box could submit jobs).
 
-Auth being off on a loopback bind is just a single-user dev
-machine, so that warns without refusing.  
+Auth being off on a loopback bind is just a single-user dev machine, so that
+warns without refusing.
 
 Let me know if you run into any annoying stuff and I can check it out.
 
@@ -430,43 +439,99 @@ when the desk is running as root — the one field to check if you only check
 one. `user` names the account tools will run as, which is the ceiling on
 what any of them can do.
 
-What the sandbox covers
-A job is confined on four axes: filesystem, network, processes, and syscalls. Everything below is enforced for the life of one job. The next section is just as explicit about what the sandbox does not do, because that is what you need to decide how much to trust a tool.
+### What the sandbox covers
 
-Enforced by the kernel, per job
-Boundary	What a job cannot do	Mechanism
-Filesystem	See the host: no home dirs, no ~/.ssh, no /var, no service secrets. It gets a read-only system base (/usr and friends), its declared inputs, its own out/, and the tool's folder.	bubblewrap mounts; no --ro-bind / /
-Network	Reach anything at all when network: false.	--unshare-net
-Processes	See host processes, share memory, or hold a controlling terminal.	--unshare-pid, --unshare-ipc, --new-session
-Environment	Read the desk's environment. No API key or shell variable of yours crosses.	cmd.Env built from scratch
-Lifetime	Outlive the desk as an orphan.	--die-with-parent, plus Pdeathsig when the desk is killed hard
-Resources	Exceed its memory or process-count cap.	systemd-run --user --scope
-Syscalls	Ask the kernel for the calls named below.	seccomp-BPF via --seccomp
-Two of those rows are conditional. Memory and process caps need a working systemd-run --user; the syscall filter needs a kernel and a bwrap that accept it. GET / reports which guarantees are actually live, and -strict refuses to start when one is missing.
+A job is confined on four axes: filesystem, network, processes, and
+syscalls. Everything below is enforced for the life of one job. The next
+section is just as explicit about what the sandbox does not do, because that
+is what you need to decide how much to trust a tool.
 
-The syscall filter
-Aspect	What it does	Why it matters
-Scope	Limits what a tool can ask the kernel for, not only what it can reach.	Namespaces bound reach; the filter bounds the request.
-Blocked calls	ptrace and process injection, bpf, kernel modules, the keyring, mounting, swap, reboot/kexec, clock and hostname changes.	Each one widens the blast radius of a sandbox escape.
-Blocked result	Returns EPERM, not SIGSYS.	A tool that merely probes sees a normal "not permitted" instead of being killed.
-Build	Pure Go: no libseccomp, no cgo.	The static-binary story stays intact.
-Verification	Probed at startup; GET / reports seccomp: true/false.	Under -strict, a sandbox with no filter is a refusal to start.
-What the sandbox does not cover
-Six things the sandbox does not do. Each is deliberate, and each is yours to work around if your deployment needs it.
+#### Enforced by the kernel, per job
 
-The account the desk runs as is the ceiling. Nothing sets a credential, so a tool runs as exactly the user the desk runs as; that is what makes "a tool can't touch anything this account can't" true. Run the desk as root and the sandbox still limits which paths exist, but every job is uid 0 and out/ is root-owned — the desk warns at startup, reports it in GET /, and -strict refuses. Per-job uid isolation is a deliberate non-goal: it needs subordinate-uid ranges and a setuid-root newuidmap, i.e. privileged per-host setup that fights the static-binary design for a narrow gain over a dedicated unprivileged account. bwrap's --unshare-user alone would remap uids only inside the namespace while files still land as the real host uid, which is security theater.
+| Boundary | What a job cannot do | Mechanism |
+|---|---|---|
+| Filesystem | See the host: no home dirs, no `~/.ssh`, no `/var`, no service secrets. It gets a read-only system base (`/usr` and friends), its declared inputs, its own `out/`, and the tool's folder. | bubblewrap mounts; no `--ro-bind / /` |
+| Network | Reach anything at all when `network: false`. | `--unshare-net` |
+| Processes | See host processes, share memory, or hold a controlling terminal. | `--unshare-pid`, `--unshare-ipc`, `--new-session` |
+| Environment | Read the desk's environment. No API key or shell variable of yours crosses. | `cmd.Env` built from scratch |
+| Lifetime | Outlive the desk as an orphan. | `--die-with-parent`, plus `Pdeathsig` when the desk is killed hard |
+| Resources | Exceed its memory or process-count cap. | `systemd-run --user --scope` |
+| Syscalls | Ask the kernel for the calls named below. | seccomp-BPF via `--seccomp` |
 
-Anything not on the denylist is allowed. The named dangerous calls are blocked; a syscall that is not on the list is allowed. The filter shrinks the blast radius of a sandbox escape rather than enumerating a minimal permitted set — the trade for working across every language runtime without an unmaintainable allowlist that fails closed on the first missed syscall. One notable call left allowed is unshare/clone(CLONE_NEWUSER): a compromised tool can still nest its own user namespace. It cannot escalate host privilege that way, but blocking it wholesale would break legitimate tools that sandbox themselves, so it stays allowed by choice.
+Two of those rows are conditional. Memory and process caps need a working
+`systemd-run --user`; the syscall filter needs a kernel and a bwrap that
+accept it. `GET /` reports which guarantees are actually live, and `-strict`
+refuses to start when one is missing.
 
-network: true is all-or-nothing. A tool that declares egress gets DNS and the TLS trust store bound in, and can reach any host. There is no per-destination allowlist, and HTTP(S)_PROXY is not set. Enforcing which hosts a tool may reach needs a filtering layer the tool cannot route around an authenticated proxy, or nftables in the job's netns. 
+#### The syscall filter
 
-That is deliberately the operator's job. The contract's boolean says whether a tool gets the network at all, never which parts of it. Bound egress outside the desk.  If you need something for this, check out my github.com/ralabarge/enclave tool, which ships with Deskbox.
+| Aspect | What it does | Why it matters |
+|---|---|---|
+| Scope | Limits what a tool can *ask the kernel for*, not only what it can reach. | Namespaces bound reach; the filter bounds the request. |
+| Blocked calls | ptrace and process injection, `bpf`, kernel modules, the keyring, mounting, swap, `reboot`/`kexec`, clock and hostname changes. | Each one widens the blast radius of a sandbox escape. |
+| Blocked result | Returns `EPERM`, not `SIGSYS`. | A tool that merely probes sees a normal "not permitted" instead of being killed. |
+| Build | Pure Go: no libseccomp, no cgo. | The static-binary story stays intact. |
+| Verification | Probed at startup; `GET /` reports `seccomp: true/false`. | Under `-strict`, a sandbox with no filter is a refusal to start. |
 
-A contract is a promise about shape, not intent. The desk enforces that a tool takes and returns what it says, writes only what it declared, and reaches only what it asked for. It cannot tell you the tool does something sensible with that; vetting the tool is still your job — which is the whole reason tools/ ships empty.
+### What the sandbox does not cover
 
-The desk itself is not sandboxed. It is an ordinary process that binds a port and runs programs. It is not confined, and that is why it defaults to loopback.
+Six things the sandbox does not do. Each is deliberate, and each is yours to
+work around if your deployment needs it.
 
-The interpreter can be pinned; the libraries it loads cannot. The run script's contents pin with run_sha256, and the interpreter its shebang names (python3, /bin/sh, …) pins with interpreter_sha256; both are checked at load and again per job. What is not pinned is everything that interpreter pulls in from /usr at runtime — shared libraries, site-packages, whatever your package manager last installed. Binding a pinned rootfs instead of the host's /usr would close that, but it would throw away "runs on any Linux with the host's runtimes", so the desk pins the two ends it can and says so.
+- **The account the desk runs as is the ceiling.** Nothing sets a credential,
+  so a tool runs as exactly the user the desk runs as; that is what makes "a
+  tool can't touch anything this account can't" true. Run the desk as root and
+  the sandbox still limits which paths exist, but every job is uid 0 and
+  `out/` is root-owned — the desk warns at startup, reports it in `GET /`,
+  and `-strict` refuses. Per-job uid isolation is a deliberate non-goal: it
+  needs subordinate-uid ranges and a setuid-root `newuidmap`, i.e. privileged
+  per-host setup that fights the static-binary design for a narrow gain over a
+  dedicated unprivileged account. bwrap's `--unshare-user` alone would remap
+  uids only *inside* the namespace while files still land as the real host
+  uid, which is security theater.
+
+- **Anything not on the denylist is allowed.** The named dangerous calls are
+  blocked; a syscall that is not on the list is allowed. The filter shrinks the
+  blast radius of a sandbox escape rather than enumerating a minimal permitted
+  set — the trade for working across every language runtime without an
+  unmaintainable allowlist that fails closed on the first missed syscall. One
+  notable call left allowed is `unshare`/`clone(CLONE_NEWUSER)`: a compromised
+  tool can still nest its own user namespace. It cannot escalate host privilege
+  that way, but blocking it wholesale would break legitimate tools that sandbox
+  themselves, so it stays allowed by choice.
+
+- **`network: true` is all-or-nothing.** A tool that declares egress gets DNS
+  and the TLS trust store bound in, and can reach **any** host. There is no
+  per-destination allowlist, and `HTTP(S)_PROXY` is not set. Enforcing *which*
+  hosts a tool may reach needs a filtering layer the tool cannot route around:
+  an authenticated proxy, or nftables in the job's netns.
+
+  That is deliberately the operator's job. The contract's boolean says whether
+  a tool gets the network at all, never which parts of it. **Bound egress
+  outside the desk.** If you need something for this, check out my
+  [enclave](https://github.com/ralabarge/enclave) tool, which ships with
+  DeskBox.
+
+- **A contract is a promise about shape, not intent.** The desk enforces that
+  a tool takes and returns what it says, writes only what it declared, and
+  reaches only what it asked for. It cannot tell you the tool does something
+  sensible with that; vetting the tool is still your job — which is the whole
+  reason `tools/` ships empty.
+
+- **The desk itself is not sandboxed.** It is an ordinary process that binds a
+  port and runs programs. It is not confined, and that is why it defaults to
+  loopback.
+
+- **The interpreter can be pinned; the libraries it loads cannot.** The run
+  script's contents pin with `run_sha256`, and the interpreter its shebang
+  names (`python3`, `/bin/sh`, …) pins with `interpreter_sha256`; both are
+  checked at load and again per job. What is not pinned is everything that
+  interpreter pulls in from `/usr` at runtime — shared libraries,
+  site-packages, whatever your package manager last installed. Binding a
+  pinned rootfs instead of the host's `/usr` would close that, but it would
+  throw away "runs on any Linux with the host's runtimes", so the desk pins
+  the two ends it can and says so.
+
 ### Integrity: making "I vetted this tool" outlast the moment you vetted it
 
 The desk refuses to load a run script other accounts can write, but that
@@ -497,7 +562,7 @@ changed, re-vet it". `-pin` reprints the current value to paste after such an
 upgrade; a compiled binary vendored as `run` has no interpreter and simply
 skips this. Both pins are also checked offline by `tcs-verify` (below).
 
-Checked in two places: At **load**, a tool
+Checked in two places: at **load**, a tool
 that doesn't match doesn't load at all — it never appears in `GET /tools`,
 so the desk only advertises tools it can stand behind. And **per job**,
 because the desk is a long-running process and a script edited an hour
@@ -518,7 +583,7 @@ what the check is for.
 
 Two deliberate choices. **Pinning is opt-in per tool**: refusing to run
 everything that hasn't adopted it yet is how a check gets switched off
-wholesale. And **`-pin` only prints**  while a flag that edited `tcs.yaml` would
+wholesale. And **`-pin` only prints** while a flag that edited `tcs.yaml` would
 re-pin whatever happens to be on disk, which is exactly what the pin exists
 to catch. Read the script, then paste.
 
@@ -797,7 +862,7 @@ loginctl enable-linger $(whoami)
 ...so the session persists independent of any active login, then restart the
 desk. If `systemd-run` isn't usable at all, the desk detects that (once at
 startup, and again if it stops working mid-run) and disables the wrapper
-instead of failing every job -- logged clearly either way, same as the
+instead of failing every job — logged clearly either way, same as the
 `bwrap`-missing and store-unset cases. Start with `-strict` if you would
 rather the desk refuse the work than run it uncapped.
 
@@ -898,12 +963,12 @@ through the interface.
       checks, and integrity-pin verification with no desk running
 - [ ] `pi` plugin: operator agent that talks to the desk (the original idea)
 
-Deliberate non-goals (documented under "What the sandbox does and does not
-cover" rather than left as gaps to close): per-job uid isolation (needs
-privileged subuid/`newuidmap` setup — run the desk as a dedicated
-unprivileged account instead), a per-host network egress allowlist
-(`network` stays all-or-nothing; bound egress outside the desk), and
-content-addressed pinning of everything under `/usr`.
+Deliberate non-goals (documented under "What the sandbox covers" and "What
+the sandbox does not cover" rather than left as gaps to close): per-job uid
+isolation (needs privileged subuid/`newuidmap` setup — run the desk as a
+dedicated unprivileged account instead), a per-host network egress
+allowlist (`network` stays all-or-nothing; bound egress outside the desk),
+and content-addressed pinning of everything under `/usr`.
 
 ## License
 
